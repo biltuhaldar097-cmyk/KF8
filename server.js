@@ -320,17 +320,11 @@ async function loginHandler(req, res) {
 
 app.post("/login", loginHandler);
 app.post("/api/auth/login", loginHandler);
-app.post("/api/login", loginHandler);
-app.post("/auth/login", loginHandler);
 
 app.get("/api/auth/me", auth, async (req, res) => {
   const user = await User.findById(req.auth.id);
   if (!user) return res.status(404).json({ success: false, message: "User not found." });
   res.json({ success: true, user: publicUser(user) });
-});
-
-app.get("/api/auth/status", (req, res) => {
-  res.json({ success: true, loginEndpoint: "/api/auth/login", database: mongoose.connection.readyState === 1 ? "connected" : "disconnected" });
 });
 
 /* =========================
@@ -1013,16 +1007,6 @@ app.post("/api/admin/transfer", auth, adminOnly, async (req, res) => {
 });
 
 /* =========================
-   API 404 HANDLER
-========================= */
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    message: `Route not found: ${req.method} ${req.path}`
-  });
-});
-
-/* =========================
    ADMIN BOOTSTRAP
 ========================= */
 
@@ -1036,10 +1020,10 @@ async function ensureAdmin() {
     return;
   }
 
-  const hash = await bcrypt.hash(password, 12);
   const existing = await User.findOne({ username });
 
   if (!existing) {
+    const hash = await bcrypt.hash(password, 12);
     await User.create({
       username,
       email,
@@ -1053,7 +1037,16 @@ async function ensureAdmin() {
 
   existing.role = "admin";
   existing.isAdmin = true;
-  // Do not overwrite the existing password on every restart.
+  existing.email = email;
+
+  // Keep the Render ADMIN_PASSWORD authoritative, but only re-hash when
+  // the configured password is actually different from the stored hash.
+  const passwordMatches = await bcrypt.compare(password, existing.password);
+  if (!passwordMatches) {
+    existing.password = await bcrypt.hash(password, 12);
+    console.log("Admin password synchronized from environment variables.");
+  }
+
   await existing.save();
 }
 

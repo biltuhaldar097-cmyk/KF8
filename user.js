@@ -32,6 +32,11 @@ const userSchema = new mongoose.Schema(
       default: false
     },
 
+    role: {
+      type: String,
+      default: "user"
+    },
+
     depositHistory: {
       type: Array,
       default: []

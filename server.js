@@ -5,654 +5,1060 @@ const mongoose = require("mongoose");
 const bcrypt = require("bcrypt");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 const User = require("./user");
 
 const app = express();
-const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_THIS_SECRET";
+const PORT = Number(process.env.PORT || 5000);
+const JWT_SECRET = process.env.JWT_SECRET;
 
+if (!JWT_SECRET) {
+  console.error("JWT_SECRET is missing.");
+  process.exit(1);
+}
+
+app.set("trust proxy", 1);
 app.use(cors({
   origin: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
+  allowedHeaders: ["Content-Type", "Authorization", "Accept"],
+  credentials: false
 }));
+app.use(express.json({ limit: "1mb" }));
 
-app.use(express.json());
+/* =========================
+   RESULT + BET MODELS
+========================= */
 
-app.get("/", (req, res) => {
-  res.json({
-    success: true,
-    message: "KF8 Backend is running"
-  });
-});
+const resultSchema = new mongoose.Schema(
+  {
+    key: { type: String, unique: true, default: "main" },
+    results: {
+      type: [
+        {
+          baji: Number,
+          patti: String,
+          single: String,
+          declared: Boolean
+        }
+      ],
+      default: []
+    }
+  },
+  { timestamps: true }
+);
 
-app.get("/api/health", async (req, res) => {
-  try {
-    await mongoose.connection.db.admin().ping();
+const Result = mongoose.models.KF8Result || mongoose.model("KF8Result", resultSchema);
 
-    res.json({
-      success: true,
-      database: "connected"
-    });
-  } catch (error) {
-    res.status(503).json({
-      success: false,
-      database: "disconnected"
-    });
+const betSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    username: { type: String, required: true },
+    baji: { type: Number, required: true, min: 1, max: 8, index: true },
+    betType: { type: String, enum: ["single", "patti", "jodi"], required: true },
+    rawTarget: { type: String, required: true },
+    stake: { type: Number, required: true, min: 0.01 },
+    multiplier: { type: Number, required: true },
+    payout: { type: Number, required: true },
+    status: { type: String, enum: ["Pending", "WON", "LOST"], default: "Pending", index: true },
+    result: { type: String, default: null },
+    createdAt: { type: Date, default: Date.now },
+    settledAt: { type: Date, default: null }
+  },
+  { timestamps: true }
+);
+
+const Bet = mongoose.models.KF8Bet || mongoose.model("KF8Bet", betSchema);
+
+/* =========================
+   REAL-TIME CONNECTIONS
+========================= */
+
+const clients = new Map();
+
+function sendEventToUser(userId, event, data) {
+  const set = clients.get(String(userId));
+  if (!set) return;
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of set) {
+    try { res.write(payload); } catch (_) {}
   }
-});
-
-function makeToken(user) {
-  return jwt.sign(
-    {
-      id: user._id.toString(),
-      username: user.username,
-      role: user.role || "user"
-    },
-    JWT_SECRET,
-    { expiresIn: "7d" }
-  );
 }
+
+function broadcast(event, data) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const set of clients.values()) {
+    for (const res of set) {
+      try { res.write(payload); } catch (_) {}
+    }
+  }
+}
+
+/* =========================
+   HELPERS
+========================= */
 
 function publicUser(user) {
   return {
     id: user._id,
     username: user.username,
     email: user.email,
-    role: user.role || "user",
+    role: user.role === "admin" || user.isAdmin ? "admin" : "user",
+    isAdmin: Boolean(user.isAdmin || user.role === "admin"),
     pts: Number(user.balance || 0),
     balance: Number(user.balance || 0),
+    totalPredictions: Number(user.totalPredictions || 0),
+    wins: Number(user.wins || 0),
+    losses: Number(user.losses || 0),
+    totalBet: Number(user.totalBet || 0),
     createdAt: user.createdAt
   };
 }
 
+function makeToken(user) {
+  return jwt.sign(
+    {
+      id: String(user._id),
+      username: user.username,
+      role: user.role === "admin" || user.isAdmin ? "admin" : "user"
+    },
+    JWT_SECRET,
+    { expiresIn: "7d" }
+  );
+}
+
 function auth(req, res, next) {
   const header = String(req.headers.authorization || "");
-  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
 
   if (!token) {
-    return res.status(401).json({
-      success: false,
-      message: "Authentication required"
-    });
+    return res.status(401).json({ success: false, message: "Authentication required." });
   }
 
   try {
     req.auth = jwt.verify(token, JWT_SECRET);
     next();
-  } catch (error) {
-    return res.status(401).json({
-      success: false,
-      message: "Invalid or expired token"
-    });
+  } catch (_) {
+    return res.status(401).json({ success: false, message: "Invalid or expired token." });
   }
 }
 
 function adminOnly(req, res, next) {
   if (req.auth?.role !== "admin") {
-    return res.status(403).json({
-      success: false,
-      message: "Admin access required"
-    });
+    return res.status(403).json({ success: false, message: "Admin access required." });
   }
   next();
 }
 
+function cleanEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function cleanUsername(value) {
+  return String(value || "").trim();
+}
+
+function cleanAmount(value) {
+  const amount = Number(value);
+  return Number.isFinite(amount) && amount > 0 ? Number(amount.toFixed(2)) : null;
+}
+
+function normalizeResults(results) {
+  if (!Array.isArray(results)) return null;
+  const rows = results.slice(0, 8).map((r, i) => ({
+    baji: Number(r.baji || i + 1),
+    patti: String(r.patti || "").replace(/\D/g, "").slice(0, 3),
+    single: String(r.single || "").replace(/\D/g, "").slice(0, 1),
+    declared: r.declared !== false
+  }));
+
+  if (rows.length !== 8) return null;
+  if (rows.some(r => r.baji < 1 || r.baji > 8 || r.patti.length !== 3 || r.single.length !== 1)) {
+    return null;
+  }
+  return rows;
+}
+
+async function getResults() {
+  const doc = await Result.findOne({ key: "main" }).lean();
+  if (doc?.results?.length === 8) return doc.results;
+
+  const defaults = Array.from({ length: 8 }, (_, i) => ({
+    baji: i + 1,
+    patti: "---",
+    single: "-",
+    declared: false
+  }));
+
+  await Result.findOneAndUpdate(
+    { key: "main" },
+    { $set: { results: defaults } },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+
+  return defaults;
+}
+
+function historyView(user) {
+  return {
+    balance: Number(user.balance || 0),
+    depositHistory: user.depositHistory || [],
+    withdrawalHistory: user.withdrawalHistory || [],
+    transactionHistory: user.transactionHistory || []
+  };
+}
+
+async function notifyUser(user) {
+  sendEventToUser(user._id, "account", { user: publicUser(user), history: historyView(user) });
+}
+
 /* =========================
-   REGISTER
+   HEALTH
+========================= */
+
+app.get("/", (req, res) => {
+  res.json({ success: true, message: "KF8 Backend is running" });
+});
+
+app.get("/api/health", async (req, res) => {
+  try {
+    await mongoose.connection.db.admin().ping();
+    res.json({ success: true, database: "connected" });
+  } catch (_) {
+    res.status(503).json({ success: false, database: "disconnected" });
+  }
+});
+
+/* =========================
+   AUTH
 ========================= */
 
 async function registerHandler(req, res) {
   try {
-    const username = String(
-      req.body.username || req.body.userName || ""
-    ).trim();
-
-    const email = String(req.body.email || "")
-      .trim()
-      .toLowerCase();
-
+    const username = cleanUsername(req.body.username || req.body.userName);
+    const email = cleanEmail(req.body.email);
     const password = String(req.body.password || "");
 
     if (!/^[A-Za-z0-9._-]{3,24}$/.test(username)) {
-      return res.status(400).json({
-        success: false,
-        message: "Username must be 3-24 characters."
-      });
+      return res.status(400).json({ success: false, message: "Username must be 3-24 characters." });
     }
 
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).json({
-        success: false,
-        message: "Enter a valid email."
-      });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ success: false, message: "Enter a valid email." });
     }
 
-    if (password.length < 6) {
-      return res.status(400).json({
-        success: false,
-        message: "Password must be at least 6 characters."
-      });
+    if (password.length < 8) {
+      return res.status(400).json({ success: false, message: "Password must be at least 8 characters." });
     }
 
-    const existingUser = await User.findOne({
+    const existing = await User.findOne({
       $or: [{ username }, { email }]
     });
 
-    if (existingUser) {
-      return res.status(409).json({
-        success: false,
-        message: "Username or email already exists."
-      });
+    if (existing) {
+      return res.status(409).json({ success: false, message: "Username or email already exists." });
     }
 
     const hashedPassword = await bcrypt.hash(password, 12);
-
-    const newUser = new User({
+    const user = await User.create({
       username,
       email,
       password: hashedPassword,
       balance: 0,
       role: "user",
-      depositHistory: [],
-      withdrawalHistory: [],
-      transactionHistory: []
+      isAdmin: false
     });
 
-    await newUser.save();
-
-    const token = makeToken(newUser);
-
+    const token = makeToken(user);
     res.status(201).json({
       success: true,
-      message: "User registered successfully",
+      message: "User registered successfully.",
       token,
-      user: publicUser(newUser)
+      user: publicUser(user)
     });
   } catch (error) {
     console.error("REGISTER ERROR:", error);
-    res.status(500).json({
-      success: false,
-      message: "Registration failed."
-    });
+    res.status(500).json({ success: false, message: "Registration failed." });
   }
 }
 
 app.post("/register", registerHandler);
 app.post("/api/auth/register", registerHandler);
 
-/* =========================
-   LOGIN
-========================= */
-
 async function loginHandler(req, res) {
   try {
-    const identity = String(
-      req.body.username ||
-      req.body.email ||
-      req.body.identity ||
-      ""
-    ).trim();
-
+    const identity = cleanUsername(req.body.username || req.body.email || req.body.identity);
     const password = String(req.body.password || "");
 
     if (!identity || !password) {
-      return res.status(400).json({
-        success: false,
-        message: "Username/email and password are required."
-      });
+      return res.status(400).json({ success: false, message: "Username/email and password are required." });
     }
 
     const user = await User.findOne({
       $or: [
         { username: identity },
-        { email: identity.toLowerCase() }
+        { email: cleanEmail(identity) }
       ]
     });
 
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid username/email or password."
-      });
-    }
-
-    const passwordOK = await bcrypt.compare(
-      password,
-      user.password
-    );
-
-    if (!passwordOK) {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid username/email or password."
-      });
+    if (!user || !(await bcrypt.compare(password, user.password))) {
+      return res.status(401).json({ success: false, message: "Invalid username/email or password." });
     }
 
     const token = makeToken(user);
-
     res.json({
       success: true,
-      message: "Login successful",
+      message: "Login successful.",
       token,
       user: publicUser(user)
     });
   } catch (error) {
     console.error("LOGIN ERROR:", error);
-    res.status(500).json({
-      success: false,
-      message: "Login failed."
-    });
+    res.status(500).json({ success: false, message: "Login failed." });
   }
 }
 
-app.post("/api/auth/login", loginHandler);
 app.post("/login", loginHandler);
-
-/* =========================
-   CURRENT USER
-========================= */
+app.post("/api/auth/login", loginHandler);
 
 app.get("/api/auth/me", auth, async (req, res) => {
-  try {
-    const user = await User.findById(req.auth.id);
+  const user = await User.findById(req.auth.id);
+  if (!user) return res.status(404).json({ success: false, message: "User not found." });
+  res.json({ success: true, user: publicUser(user) });
+});
 
+/* =========================
+   PASSWORD RESET
+========================= */
+
+app.post("/api/auth/forgot-password", async (req, res) => {
+  try {
+    const email = cleanEmail(req.body.email);
+    const user = await User.findOne({ email });
+
+    // Do not reveal whether an email exists.
     if (!user) {
-      return res.status(404).json({
+      return res.json({ success: true, message: "If the account exists, a verification code has been sent." });
+    }
+
+    const otp = String(crypto.randomInt(100000, 1000000));
+    const otpHash = crypto.createHash("sha256").update(otp).digest("hex");
+
+    user.resetOtpHash = otpHash;
+    user.resetOtpExpires = new Date(Date.now() + 10 * 60 * 1000);
+    await user.save();
+
+    if (!process.env.RESEND_API_KEY || !process.env.RESET_FROM_EMAIL) {
+      console.warn("Password reset requested but RESEND_API_KEY/RESET_FROM_EMAIL is not configured.");
+      return res.status(503).json({
         success: false,
-        message: "User not found."
+        message: "Password recovery email is not configured on the backend yet."
       });
     }
 
-    res.json({
-      success: true,
-      user: publicUser(user)
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        from: process.env.RESET_FROM_EMAIL,
+        to: [email],
+        subject: "KF8 password reset code",
+        text: `Your KF8 password reset code is ${otp}. It expires in 10 minutes.`
+      })
     });
+
+    if (!response.ok) {
+      console.error("RESET EMAIL ERROR:", await response.text());
+      return res.status(502).json({ success: false, message: "Unable to send the reset email." });
+    }
+
+    res.json({ success: true, message: "Verification code sent. Check your email." });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Unable to load account."
-    });
+    console.error("FORGOT PASSWORD ERROR:", error);
+    res.status(500).json({ success: false, message: "Password recovery failed." });
+  }
+});
+
+app.post("/api/auth/reset-password", async (req, res) => {
+  try {
+    const email = cleanEmail(req.body.email);
+    const otp = String(req.body.otp || "").trim();
+    const newPassword = String(req.body.newPassword || "");
+
+    if (!email || !/^\d{6}$/.test(otp) || newPassword.length < 8) {
+      return res.status(400).json({ success: false, message: "Invalid reset details." });
+    }
+
+    const otpHash = crypto.createHash("sha256").update(otp).digest("hex");
+    const user = await User.findOne({
+      email,
+      resetOtpHash: otpHash,
+      resetOtpExpires: { $gt: new Date() }
+    }).select("+resetOtpHash +resetOtpExpires");
+
+    if (!user) {
+      return res.status(400).json({ success: false, message: "Invalid or expired verification code." });
+    }
+
+    user.password = await bcrypt.hash(newPassword, 12);
+    user.resetOtpHash = null;
+    user.resetOtpExpires = null;
+    await user.save();
+
+    res.json({ success: true, message: "Password reset successfully." });
+  } catch (error) {
+    console.error("RESET PASSWORD ERROR:", error);
+    res.status(500).json({ success: false, message: "Password reset failed." });
   }
 });
 
 /* =========================
-   BALANCE
+   REAL-TIME EVENTS
+========================= */
+
+app.get("/api/events", async (req, res) => {
+  const token = String(req.query.token || "");
+  if (!token) return res.status(401).end();
+
+  let decoded;
+  try {
+    decoded = jwt.verify(token, JWT_SECRET);
+  } catch (_) {
+    return res.status(401).end();
+  }
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  const userId = String(decoded.id);
+  if (!clients.has(userId)) clients.set(userId, new Set());
+  clients.get(userId).add(res);
+
+  res.write(`event: connected\ndata: ${JSON.stringify({ success: true })}\n\n`);
+
+  try {
+    const user = await User.findById(userId);
+    if (user) sendEventToUser(userId, "account", { user: publicUser(user), history: historyView(user) });
+    const results = await getResults();
+    res.write(`event: results\ndata: ${JSON.stringify({ results })}\n\n`);
+  } catch (_) {}
+
+  const heartbeat = setInterval(() => {
+    try { res.write(": heartbeat\n\n"); } catch (_) {}
+  }, 20000);
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    const set = clients.get(userId);
+    if (set) {
+      set.delete(res);
+      if (!set.size) clients.delete(userId);
+    }
+  });
+});
+
+/* =========================
+   BALANCE + HISTORY
 ========================= */
 
 app.get("/api/balance", auth, async (req, res) => {
-  try {
-    const user = await User.findById(req.auth.id);
+  const user = await User.findById(req.auth.id);
+  if (!user) return res.status(404).json({ success: false, message: "User not found." });
+  res.json({ success: true, balance: Number(user.balance || 0), pts: Number(user.balance || 0) });
+});
 
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found."
-      });
-    }
+app.get("/api/history", auth, async (req, res) => {
+  const user = await User.findById(req.auth.id);
+  if (!user) return res.status(404).json({ success: false, message: "User not found." });
+  res.json({ success: true, ...historyView(user) });
+});
 
-    res.json({
-      success: true,
-      balance: Number(user.balance || 0),
-      pts: Number(user.balance || 0)
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Unable to load balance."
-    });
+// Kept only as a compatibility route; it still requires the logged-in user.
+app.get("/history/:email", auth, async (req, res) => {
+  const requested = cleanEmail(req.params.email);
+  const user = await User.findById(req.auth.id);
+  if (!user || user.email !== requested) {
+    return res.status(403).json({ success: false, message: "You can only view your own history." });
   }
+  res.json({ success: true, ...historyView(user) });
 });
 
 /* =========================
-   DEPOSIT
+   DEPOSIT REQUESTS
 ========================= */
 
-async function depositHandler(req, res) {
+app.post("/api/deposit", auth, async (req, res) => {
   try {
-    const email = String(req.body.email || "")
-      .trim()
-      .toLowerCase();
+    const amount = cleanAmount(req.body.amount);
+    const utr = String(req.body.utr || req.body.UTR || req.body.transactionId || "").trim();
 
-    const amount = Number(req.body.amount);
-
-    const utr = String(
-      req.body.utr ||
-      req.body.UTR ||
-      req.body.transactionId ||
-      ""
-    ).trim();
-
-    if (!email || !Number.isFinite(amount) || amount <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Valid email and amount are required."
-      });
+    if (!amount || utr.length < 6) {
+      return res.status(400).json({ success: false, message: "Valid amount and UTR are required." });
     }
 
-    const user = await User.findOne({ email });
+    const user = await User.findById(req.auth.id);
+    if (!user) return res.status(404).json({ success: false, message: "User not found." });
 
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found"
-      });
-    }
-
-    user.balance = Number(user.balance || 0) + amount;
-
-    if (!Array.isArray(user.depositHistory)) {
-      user.depositHistory = [];
-    }
-
-    if (!Array.isArray(user.transactionHistory)) {
-      user.transactionHistory = [];
-    }
-
-    user.depositHistory.push({
-      amount,
-      utr,
-      date: new Date()
-    });
-
-    user.transactionHistory.push({
+    const requestId = new mongoose.Types.ObjectId().toString();
+    const item = {
+      id: requestId,
       type: "Deposit",
       amount,
       utr,
+      status: "Pending",
+      details: "UPI deposit request",
       date: new Date()
-    });
+    };
 
+    user.depositHistory.unshift(item);
+    user.transactionHistory.unshift(item);
     await user.save();
 
-    res.json({
+    sendEventToUser(user._id, "account", { user: publicUser(user), history: historyView(user) });
+    broadcast("admin-data", { type: "deposit-created" });
+
+    res.status(201).json({
       success: true,
-      message: "Deposit successful",
-      balance: user.balance
+      message: "Deposit request submitted.",
+      request: item,
+      balance: Number(user.balance || 0)
     });
   } catch (error) {
     console.error("DEPOSIT ERROR:", error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    res.status(500).json({ success: false, message: "Deposit request failed." });
   }
-}
-
-app.post("/deposit", depositHandler);
-app.post("/api/deposit", depositHandler);
+});
 
 /* =========================
-   WITHDRAW
+   WITHDRAWAL REQUESTS
 ========================= */
 
-async function withdrawalHandler(req, res) {
+app.post("/api/withdrawal", auth, async (req, res) => {
   try {
-    const email = String(req.body.email || "")
-      .trim()
-      .toLowerCase();
+    const amount = cleanAmount(req.body.amount);
+    const upi = String(req.body.upi || req.body.upiId || "").trim();
 
-    const amount = Number(req.body.amount);
-
-    const utr = String(
-      req.body.utr ||
-      req.body.UTR ||
-      req.body.transactionId ||
-      ""
-    ).trim();
-
-    const upi = String(
-      req.body.upi ||
-      req.body.upiId ||
-      ""
-    ).trim();
-
-    if (!email || !Number.isFinite(amount) || amount <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Valid email and amount are required."
-      });
+    if (!amount || !upi) {
+      return res.status(400).json({ success: false, message: "Valid amount and UPI ID are required." });
     }
 
-    const user = await User.findOne({ email });
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found"
-      });
-    }
+    const user = await User.findById(req.auth.id);
+    if (!user) return res.status(404).json({ success: false, message: "User not found." });
 
     if (Number(user.balance || 0) < amount) {
-      return res.status(400).json({
-        success: false,
-        message: "Insufficient balance"
-      });
+      return res.status(400).json({ success: false, message: "Insufficient balance." });
     }
 
-    user.balance = Number(user.balance || 0) - amount;
+    user.balance = Number((Number(user.balance || 0) - amount).toFixed(2));
 
-    if (!Array.isArray(user.withdrawalHistory)) {
-      user.withdrawalHistory = [];
-    }
-
-    if (!Array.isArray(user.transactionHistory)) {
-      user.transactionHistory = [];
-    }
-
-    user.withdrawalHistory.push({
-      amount,
-      utr,
-      upi,
-      status: "Pending",
-      date: new Date()
-    });
-
-    user.transactionHistory.push({
+    const requestId = new mongoose.Types.ObjectId().toString();
+    // Deliberately do NOT store UTR/transactionId for withdrawals.
+    const item = {
+      id: requestId,
       type: "Withdrawal",
       amount,
-      utr,
       upi,
       status: "Pending",
+      details: "UPI withdrawal request",
+      date: new Date()
+    };
+
+    user.withdrawalHistory.unshift(item);
+    user.transactionHistory.unshift(item);
+    await user.save();
+
+    sendEventToUser(user._id, "account", { user: publicUser(user), history: historyView(user) });
+    broadcast("admin-data", { type: "withdrawal-created" });
+
+    res.status(201).json({
+      success: true,
+      message: "Withdrawal request submitted.",
+      request: item,
+      balance: Number(user.balance || 0)
+    });
+  } catch (error) {
+    console.error("WITHDRAW ERROR:", error);
+    res.status(500).json({ success: false, message: "Withdrawal request failed." });
+  }
+});
+
+/* =========================
+   BETS
+========================= */
+
+app.post("/api/bets", auth, async (req, res) => {
+  try {
+    const baji = Number(req.body.baji);
+    const betType = String(req.body.betType || "").toLowerCase();
+    const rawTarget = String(req.body.rawTarget ?? req.body.target ?? "").trim();
+    const stake = cleanAmount(req.body.stake);
+
+    const multipliers = { single: 9, patti: 90, jodi: 90 };
+    if (!Number.isInteger(baji) || baji < 1 || baji > 8 || !multipliers[betType] || !stake || !rawTarget) {
+      return res.status(400).json({ success: false, message: "Invalid bet details." });
+    }
+
+    if (
+      (betType === "single" && !/^\d$/.test(rawTarget)) ||
+      (betType === "patti" && !/^\d{3}$/.test(rawTarget)) ||
+      (betType === "jodi" && !/^\d{2}$/.test(rawTarget))
+    ) {
+      return res.status(400).json({ success: false, message: "Invalid target." });
+    }
+
+    const user = await User.findById(req.auth.id);
+    if (!user) return res.status(404).json({ success: false, message: "User not found." });
+
+    if (Number(user.balance || 0) < stake) {
+      return res.status(400).json({ success: false, message: "Insufficient balance." });
+    }
+
+    user.balance = Number((Number(user.balance || 0) - stake).toFixed(2));
+    user.totalPredictions = Number(user.totalPredictions || 0) + 1;
+    user.totalBet = Number((Number(user.totalBet || 0) + stake).toFixed(2));
+
+    const multiplier = multipliers[betType];
+    const bet = await Bet.create({
+      userId: user._id,
+      username: user.username,
+      baji,
+      betType,
+      rawTarget,
+      stake,
+      multiplier,
+      payout: Number((stake * multiplier).toFixed(2))
+    });
+
+    user.transactionHistory.unshift({
+      id: String(bet._id),
+      type: "Bet Placed",
+      amount: -stake,
+      status: "Pending",
+      baji,
+      betType,
+      rawTarget,
+      stake,
+      payout: bet.payout,
+      details: `Kolkata FF 8 Baji ${baji}`,
       date: new Date()
     });
 
     await user.save();
+    await notifyUser(user);
 
-    res.json({
+    res.status(201).json({
       success: true,
-      message: "Withdrawal request submitted",
-      balance: user.balance,
-      status: "Pending"
+      message: "Bet placed.",
+      bet,
+      user: publicUser(user)
     });
   } catch (error) {
-    console.error("WITHDRAW ERROR:", error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    console.error("BET ERROR:", error);
+    res.status(500).json({ success: false, message: "Bet could not be placed." });
   }
-}
-
-app.post("/withdraw", withdrawalHandler);
-app.post("/api/withdraw", withdrawalHandler);
-app.post("/api/withdrawal", withdrawalHandler);
+});
 
 /* =========================
-   HISTORY
+   RESULTS
 ========================= */
 
-app.get("/history/:email", async (req, res) => {
-  try {
-    const email = String(req.params.email || "")
-      .trim()
-      .toLowerCase();
+app.get("/api/results", async (req, res) => {
+  const results = await getResults();
+  res.json({ success: true, results });
+});
 
-    const user = await User.findOne({ email });
+app.get("/api/latest-results", async (req, res) => {
+  const results = await getResults();
+  res.json({ success: true, results });
+});
 
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found"
-      });
+async function settleBaji(baji, patti, single) {
+  const bets = await Bet.find({ baji, status: "Pending" });
+  let winners = 0;
+
+  for (const bet of bets) {
+    let won = false;
+
+    if (bet.betType === "single") won = bet.rawTarget === single;
+    if (bet.betType === "patti") won = bet.rawTarget === patti;
+    // Jodi settlement is only possible if a 2-digit jodi is supplied with the result.
+    if (bet.betType === "jodi") won = false;
+
+    const user = await User.findById(bet.userId);
+    if (!user) continue;
+
+    const historyItem = user.transactionHistory.id ? user.transactionHistory.id(String(bet._id)) : null;
+
+    if (won) {
+      user.balance = Number((Number(user.balance || 0) + Number(bet.payout || 0)).toFixed(2));
+      user.wins = Number(user.wins || 0) + 1;
+      bet.status = "WON";
+      bet.result = `${patti}/${single}`;
+      bet.settledAt = new Date();
+
+      const tx = user.transactionHistory.find(x => String(x.id) === String(bet._id));
+      if (tx) {
+        tx.status = "WON";
+        tx.amount = Number(bet.payout || 0);
+        tx.details = `Won ${bet.multiplier}x`;
+      }
+      winners++;
+    } else {
+      user.losses = Number(user.losses || 0) + 1;
+      bet.status = "LOST";
+      bet.result = `${patti}/${single}`;
+      bet.settledAt = new Date();
+
+      const tx = user.transactionHistory.find(x => String(x.id) === String(bet._id));
+      if (tx) {
+        tx.status = "LOST";
+        tx.details = "Bet lost";
+      }
     }
 
+    await user.save();
+    await bet.save();
+    await notifyUser(user);
+  }
+
+  return winners;
+}
+
+app.post("/api/admin/results", auth, adminOnly, async (req, res) => {
+  try {
+    const baji = Number(req.body.baji);
+    const patti = String(req.body.patti || "").replace(/\D/g, "").slice(0, 3);
+    const single = String(req.body.single || "").replace(/\D/g, "").slice(0, 1);
+
+    if (!Number.isInteger(baji) || baji < 1 || baji > 8 || patti.length !== 3 || single.length !== 1) {
+      return res.status(400).json({ success: false, message: "Valid Baji, Patti and Single are required." });
+    }
+
+    const current = await getResults();
+    const next = current.map((r, i) =>
+      Number(r.baji) === baji
+        ? { baji, patti, single, declared: true }
+        : { ...r, baji: Number(r.baji || i + 1) }
+    );
+
+    await Result.findOneAndUpdate(
+      { key: "main" },
+      { $set: { results: next } },
+      { upsert: true, new: true }
+    );
+
+    const winners = await settleBaji(baji, patti, single);
+
+    broadcast("results", { results: next });
+    broadcast("admin-data", { type: "result-updated", baji });
+
     res.json({
       success: true,
-      balance: user.balance,
-      depositHistory: user.depositHistory || [],
-      withdrawalHistory: user.withdrawalHistory || [],
-      transactionHistory: user.transactionHistory || []
+      message: `Baji ${baji} result updated.`,
+      results: next,
+      winners
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    console.error("ADMIN RESULT ERROR:", error);
+    res.status(500).json({ success: false, message: "Result update failed." });
+  }
+});
+
+app.post("/api/admin/latest-results", auth, adminOnly, async (req, res) => {
+  try {
+    const rows = normalizeResults(req.body.results);
+    if (!rows) return res.status(400).json({ success: false, message: "Exactly 8 valid results are required." });
+
+    await Result.findOneAndUpdate(
+      { key: "main" },
+      { $set: { results: rows } },
+      { upsert: true, new: true }
+    );
+
+    broadcast("results", { results: rows });
+    broadcast("admin-data", { type: "results-updated" });
+
+    res.json({ success: true, results: rows });
+  } catch (error) {
+    console.error("LATEST RESULTS ERROR:", error);
+    res.status(500).json({ success: false, message: "Latest results update failed." });
   }
 });
 
 /* =========================
-   ADMIN USERS
+   ADMIN DATA
 ========================= */
 
-app.get("/admin/users", auth, adminOnly, async (req, res) => {
-  try {
-    const users = await User.find().select("-password");
+app.get("/api/admin/users", auth, adminOnly, async (req, res) => {
+  const users = await User.find().select("-password -resetOtpHash -resetOtpExpires").sort({ createdAt: -1 });
+  res.json({ success: true, totalUsers: users.length, users: users.map(publicUser) });
+});
 
-    res.json({
-      success: true,
-      totalUsers: users.length,
-      users
-    });
+app.get("/admin/users", auth, adminOnly, async (req, res) => {
+  const users = await User.find().select("-password -resetOtpHash -resetOtpExpires").sort({ createdAt: -1 });
+  res.json({ success: true, totalUsers: users.length, users });
+});
+
+app.get("/api/admin/deposits", auth, adminOnly, async (req, res) => {
+  const users = await User.find().select("username email depositHistory");
+  const requests = [];
+  for (const user of users) {
+    for (const item of user.depositHistory || []) {
+      if (String(item.status).toLowerCase() === "pending") {
+        requests.push({
+          id: item.id,
+          username: user.username,
+          email: user.email,
+          amount: Number(item.amount || 0),
+          utr: item.utr || "",
+          status: item.status,
+          date: item.date
+        });
+      }
+    }
+  }
+  requests.sort((a, b) => new Date(b.date) - new Date(a.date));
+  res.json({ success: true, requests });
+});
+
+app.get("/api/admin/withdrawals", auth, adminOnly, async (req, res) => {
+  const users = await User.find().select("username email withdrawalHistory");
+  const requests = [];
+  for (const user of users) {
+    for (const item of user.withdrawalHistory || []) {
+      if (String(item.status).toLowerCase() === "pending") {
+        requests.push({
+          id: item.id,
+          username: user.username,
+          email: user.email,
+          amount: Number(item.amount || 0),
+          upi: item.upi || "",
+          status: item.status,
+          date: item.date
+        });
+      }
+    }
+  }
+  requests.sort((a, b) => new Date(b.date) - new Date(a.date));
+  res.json({ success: true, requests });
+});
+
+async function findHistoryOwner(historyName, requestId) {
+  const users = await User.find().select(historyName);
+  for (const user of users) {
+    const item = (user[historyName] || []).find(x => String(x.id) === String(requestId));
+    if (item) return { user, item };
+  }
+  return null;
+}
+
+app.post("/api/admin/deposits/:requestId", auth, adminOnly, async (req, res) => {
+  try {
+    const action = String(req.body.action || "").toLowerCase();
+    if (!["approve", "reject"].includes(action)) {
+      return res.status(400).json({ success: false, message: "Action must be approve or reject." });
+    }
+
+    const found = await findHistoryOwner("depositHistory", req.params.requestId);
+    if (!found) return res.status(404).json({ success: false, message: "Deposit request not found." });
+
+    const { user, item } = found;
+    if (String(item.status).toLowerCase() !== "pending") {
+      return res.status(409).json({ success: false, message: "Deposit request already processed." });
+    }
+
+    if (action === "approve") {
+      user.balance = Number((Number(user.balance || 0) + Number(item.amount || 0)).toFixed(2));
+      item.status = "Approved";
+      item.details = "Deposit approved by admin";
+      item.reviewedAt = new Date();
+
+      const tx = user.transactionHistory.find(x => String(x.id) === String(item.id));
+      if (tx) {
+        tx.status = "Approved";
+        tx.details = "Deposit approved by admin";
+      }
+    } else {
+      item.status = "Rejected";
+      item.details = "Deposit rejected by admin";
+      item.reviewedAt = new Date();
+
+      const tx = user.transactionHistory.find(x => String(x.id) === String(item.id));
+      if (tx) {
+        tx.status = "Rejected";
+        tx.details = "Deposit rejected by admin";
+      }
+    }
+
+    await user.save();
+    await notifyUser(user);
+    broadcast("admin-data", { type: "deposit-processed" });
+
+    res.json({ success: true, message: `Deposit ${action}ed.`, user: publicUser(user), request: item });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    console.error("ADMIN DEPOSIT ERROR:", error);
+    res.status(500).json({ success: false, message: "Deposit processing failed." });
+  }
+});
+
+app.post("/api/admin/withdrawals/:requestId", auth, adminOnly, async (req, res) => {
+  try {
+    const action = String(req.body.action || "").toLowerCase();
+    if (!["approve", "reject"].includes(action)) {
+      return res.status(400).json({ success: false, message: "Action must be approve or reject." });
+    }
+
+    const found = await findHistoryOwner("withdrawalHistory", req.params.requestId);
+    if (!found) return res.status(404).json({ success: false, message: "Withdrawal request not found." });
+
+    const { user, item } = found;
+    if (String(item.status).toLowerCase() !== "pending") {
+      return res.status(409).json({ success: false, message: "Withdrawal request already processed." });
+    }
+
+    if (action === "reject") {
+      user.balance = Number((Number(user.balance || 0) + Number(item.amount || 0)).toFixed(2));
+      item.status = "Rejected";
+      item.details = "Withdrawal rejected; amount refunded";
+      item.reviewedAt = new Date();
+
+      const tx = user.transactionHistory.find(x => String(x.id) === String(item.id));
+      if (tx) {
+        tx.status = "Refunded";
+        tx.details = "Withdrawal rejected; amount refunded";
+        tx.amount = Number(item.amount || 0);
+      }
+    } else {
+      item.status = "Approved";
+      item.details = "Withdrawal approved by admin";
+      item.reviewedAt = new Date();
+
+      const tx = user.transactionHistory.find(x => String(x.id) === String(item.id));
+      if (tx) {
+        tx.status = "Approved";
+        tx.details = "Withdrawal approved by admin";
+      }
+    }
+
+    await user.save();
+    await notifyUser(user);
+    broadcast("admin-data", { type: "withdrawal-processed" });
+
+    res.json({ success: true, message: `Withdrawal ${action}ed.`, user: publicUser(user), request: item });
+  } catch (error) {
+    console.error("ADMIN WITHDRAWAL ERROR:", error);
+    res.status(500).json({ success: false, message: "Withdrawal processing failed." });
   }
 });
 
 /* =========================
-   ADMIN TRANSFER
+   ADMIN BALANCE TRANSFER
 ========================= */
 
 app.post("/api/admin/transfer", auth, adminOnly, async (req, res) => {
   try {
-    const username = String(req.body.username || "").trim();
-    const amount = Number(req.body.amount);
+    const username = cleanUsername(req.body.username);
+    const amount = cleanAmount(req.body.amount);
     const action = String(req.body.action || "add").toLowerCase();
 
-    if (!username || !Number.isFinite(amount) || amount <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Username and valid amount are required."
-      });
-    }
-
-    if (!["add", "deduct"].includes(action)) {
-      return res.status(400).json({
-        success: false,
-        message: "Action must be add or deduct."
-      });
+    if (!username || !amount || !["add", "deduct"].includes(action)) {
+      return res.status(400).json({ success: false, message: "Username, valid amount and action are required." });
     }
 
     const user = await User.findOne({ username });
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found."
-      });
-    }
+    if (!user) return res.status(404).json({ success: false, message: "User not found." });
 
     const current = Number(user.balance || 0);
-    const next = action === "add"
-      ? current + amount
-      : current - amount;
+    const next = action === "add" ? current + amount : current - amount;
 
     if (next < 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Balance cannot go below zero."
-      });
+      return res.status(400).json({ success: false, message: "Balance cannot go below zero." });
     }
 
-    user.balance = next;
+    user.balance = Number(next.toFixed(2));
 
-    if (!Array.isArray(user.transactionHistory)) {
-      user.transactionHistory = [];
-    }
-
-    user.transactionHistory.push({
-      type: action === "add"
-        ? "Admin Transfer"
-        : "Admin Deduction",
-      amount,
+    const tx = {
+      id: new mongoose.Types.ObjectId().toString(),
+      type: action === "add" ? "Admin Transfer" : "Admin Deduction",
+      amount: action === "add" ? amount : -amount,
       status: "Completed",
+      details: `Admin ${action === "add" ? "added" : "deducted"} balance`,
       date: new Date()
-    });
+    };
 
+    user.transactionHistory.unshift(tx);
     await user.save();
+    await notifyUser(user);
 
     res.json({
       success: true,
-      message: action === "add"
-        ? "Balance added."
-        : "Balance deducted.",
+      message: action === "add" ? "Balance added." : "Balance deducted.",
       user: publicUser(user)
     });
   } catch (error) {
     console.error("ADMIN TRANSFER ERROR:", error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    res.status(500).json({ success: false, message: "Balance update failed." });
   }
 });
 
 /* =========================
-   TEST USER MODEL
+   ADMIN BOOTSTRAP
 ========================= */
 
-app.get("/test-user-model", async (req, res) => {
-  try {
-    const users = await User.find().select("-password");
+async function ensureAdmin() {
+  const username = cleanUsername(process.env.ADMIN_USERNAME);
+  const password = String(process.env.ADMIN_PASSWORD || "");
+  const email = cleanEmail(process.env.ADMIN_EMAIL);
 
-    res.json({
-      success: true,
-      users
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+  if (!username || !password || !email) {
+    console.warn("ADMIN_USERNAME/ADMIN_PASSWORD/ADMIN_EMAIL not configured; existing admin users can still log in.");
+    return;
   }
-});
+
+  const hash = await bcrypt.hash(password, 12);
+  const existing = await User.findOne({ username });
+
+  if (!existing) {
+    await User.create({
+      username,
+      email,
+      password: hash,
+      role: "admin",
+      isAdmin: true
+    });
+    console.log("Admin account created from environment variables.");
+    return;
+  }
+
+  existing.role = "admin";
+  existing.isAdmin = true;
+  // Do not overwrite the existing password on every restart.
+  await existing.save();
+}
 
 /* =========================
-   START SERVER
+   START
 ========================= */
 
 async function startServer() {
   try {
-    if (!process.env.MONGODB_URI) {
-      throw new Error("MONGODB_URI is missing in .env");
-    }
-
+    if (!process.env.MONGODB_URI) throw new Error("MONGODB_URI is missing in Render Environment.");
     await mongoose.connect(process.env.MONGODB_URI);
+    console.log("MongoDB connected successfully.");
 
-    console.log("MongoDB connected successfully");
+    await ensureAdmin();
+    await getResults();
 
-    app.listen(PORT, () => {
+    app.listen(PORT, "0.0.0.0", () => {
       console.log(`KF8 Backend running on port ${PORT}`);
     });
   } catch (error) {
-    console.error(
-      "MongoDB connection failed:",
-      error.message
-    );
-
+    console.error("STARTUP ERROR:", error.message);
     process.exit(1);
   }
 }

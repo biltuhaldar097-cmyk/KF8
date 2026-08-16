@@ -794,6 +794,10 @@ app.post("/api/admin/latest-results", auth, adminOnly, async (req, res) => {
    ADMIN DATA
 ========================= */
 
+app.get("/api/admin/check", auth, adminOnly, async (req, res) => {
+  res.json({ success: true, admin: true, username: req.auth.username || null });
+});
+
 app.get("/api/admin/users", auth, adminOnly, async (req, res) => {
   const users = await User.find().select("-password -resetOtpHash -resetOtpExpires").sort({ createdAt: -1 });
   res.json({ success: true, totalUsers: users.length, users: users.map(publicUser) });
@@ -970,7 +974,7 @@ app.post("/api/admin/transfer", auth, adminOnly, async (req, res) => {
       return res.status(400).json({ success: false, message: "Username, valid amount and action are required." });
     }
 
-    const user = await User.findOne({ username });
+    const user = await User.findOne({ username: { $regex: `^${username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, $options: "i" } });
     if (!user) return res.status(404).json({ success: false, message: "User not found." });
 
     const current = Number(user.balance || 0);

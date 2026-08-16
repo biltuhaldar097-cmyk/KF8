@@ -320,11 +320,17 @@ async function loginHandler(req, res) {
 
 app.post("/login", loginHandler);
 app.post("/api/auth/login", loginHandler);
+app.post("/api/login", loginHandler);
+app.post("/auth/login", loginHandler);
 
 app.get("/api/auth/me", auth, async (req, res) => {
   const user = await User.findById(req.auth.id);
   if (!user) return res.status(404).json({ success: false, message: "User not found." });
   res.json({ success: true, user: publicUser(user) });
+});
+
+app.get("/api/auth/status", (req, res) => {
+  res.json({ success: true, loginEndpoint: "/api/auth/login", database: mongoose.connection.readyState === 1 ? "connected" : "disconnected" });
 });
 
 /* =========================
@@ -1004,6 +1010,16 @@ app.post("/api/admin/transfer", auth, adminOnly, async (req, res) => {
     console.error("ADMIN TRANSFER ERROR:", error);
     res.status(500).json({ success: false, message: "Balance update failed." });
   }
+});
+
+/* =========================
+   API 404 HANDLER
+========================= */
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: `Route not found: ${req.method} ${req.path}`
+  });
 });
 
 /* =========================

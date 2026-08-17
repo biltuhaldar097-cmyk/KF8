@@ -1,20 +1,121 @@
-{
-  "name": "kf8-backend-fixed",
-  "version": "1.0.0",
-  "private": true,
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
+const mongoose = require("mongoose");
+
+const historyItemSchema = new mongoose.Schema(
+  {
+    id: { type: String, default: () => new mongoose.Types.ObjectId().toString() },
+    type: { type: String, required: true },
+    amount: { type: Number, default: 0 },
+    status: { type: String, default: "Completed" },
+    utr: { type: String, default: undefined },
+    upi: { type: String, default: undefined },
+    baji: { type: Number, default: undefined },
+    betType: { type: String, default: undefined },
+    rawTarget: { type: String, default: undefined },
+    target: { type: String, default: undefined },
+    stake: { type: Number, default: undefined },
+    payout: { type: Number, default: undefined },
+    details: { type: String, default: "" },
+    date: { type: Date, default: Date.now },
+    reviewedAt: { type: Date, default: undefined }
   },
-  "engines": {
-    "node": ">=18"
+  { _id: false, minimize: false }
+);
+
+const userSchema = new mongoose.Schema(
+  {
+    username: {
+      type: String,
+      required: true,
+      unique: true,
+      trim: true,
+      minlength: 3,
+      maxlength: 24
+    },
+
+    email: {
+      type: String,
+      required: true,
+      unique: true,
+      lowercase: true,
+      trim: true
+    },
+
+    password: {
+      type: String,
+      required: true
+    },
+
+    balance: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+
+    isAdmin: {
+      type: Boolean,
+      default: false
+    },
+
+    role: {
+      type: String,
+      enum: ["user", "admin"],
+      default: "user"
+    },
+
+    totalPredictions: {
+      type: Number,
+      default: 0
+    },
+
+    wins: {
+      type: Number,
+      default: 0
+    },
+
+    losses: {
+      type: Number,
+      default: 0
+    },
+
+    totalBet: {
+      type: Number,
+      default: 0
+    },
+
+    depositHistory: {
+      type: [historyItemSchema],
+      default: []
+    },
+
+    withdrawalHistory: {
+      type: [historyItemSchema],
+      default: []
+    },
+
+    transactionHistory: {
+      type: [historyItemSchema],
+      default: []
+    },
+
+    resetOtpHash: {
+      type: String,
+      default: null,
+      select: false
+    },
+
+    resetOtpExpires: {
+      type: Date,
+      default: null,
+      select: false
+    }
   },
-  "dependencies": {
-    "bcrypt": "^5.1.1",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.21.2",
-    "jsonwebtoken": "^9.0.2",
-    "mongoose": "^8.9.5"
-  }
-}
+  { timestamps: true }
+);
+
+userSchema.pre("save", function(next) {
+  if (this.role === "admin") this.isAdmin = true;
+  if (this.isAdmin) this.role = "admin";
+  next();
+});
+
+module.exports = mongoose.model("User", userSchema);

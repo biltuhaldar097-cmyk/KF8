@@ -39,7 +39,8 @@ const resultSchema = new mongoose.Schema(
           baji: Number,
           patti: String,
           single: String,
-          declared: Boolean
+          declared: Boolean,
+          resultAt: String
         }
       ],
       default: []
@@ -163,13 +164,30 @@ function cleanAmount(value) {
   return Number.isFinite(amount) && amount > 0 ? Number(amount.toFixed(2)) : null;
 }
 
+const BAJI_RESULT_TIMES = {
+  1: "10:05",
+  2: "11:05",
+  3: "13:05",
+  4: "14:35",
+  5: "16:05",
+  6: "17:35",
+  7: "19:05",
+  8: "20:35"
+};
+
+function resultAtForBaji(baji) {
+  const value = BAJI_RESULT_TIMES[Number(baji)] || "23:59";
+  return value;
+}
+
 function normalizeResults(results) {
   if (!Array.isArray(results)) return null;
   const rows = results.slice(0, 8).map((r, i) => ({
     baji: Number(r.baji || i + 1),
     patti: String(r.patti || "").replace(/\D/g, "").slice(0, 3),
     single: String(r.single || "").replace(/\D/g, "").slice(0, 1),
-    declared: r.declared !== false
+    declared: r.declared !== false,
+    resultAt: String(r.resultAt || resultAtForBaji(r.baji || i + 1))
   }));
 
   if (rows.length !== 8) return null;
@@ -181,13 +199,22 @@ function normalizeResults(results) {
 
 async function getResults() {
   const doc = await Result.findOne({ key: "main" }).lean();
-  if (doc?.results?.length === 8) return doc.results;
+  if (doc?.results?.length === 8) {
+    return doc.results.map((r, i) => ({
+      baji: Number(r.baji || i + 1),
+      patti: String(r.patti || "---"),
+      single: String(r.single || "-"),
+      declared: Boolean(r.declared),
+      resultAt: String(r.resultAt || resultAtForBaji(r.baji || i + 1))
+    }));
+  }
 
   const defaults = Array.from({ length: 8 }, (_, i) => ({
     baji: i + 1,
     patti: "---",
     single: "-",
-    declared: false
+    declared: false,
+    resultAt: resultAtForBaji(i + 1)
   }));
 
   await Result.findOneAndUpdate(
@@ -325,6 +352,29 @@ app.get("/api/auth/me", auth, async (req, res) => {
   const user = await User.findById(req.auth.id);
   if (!user) return res.status(404).json({ success: false, message: "User not found." });
   res.json({ success: true, user: publicUser(user) });
+});
+
+app.post("/api/admin/unlock", async (req, res) => {
+  try {
+    const password = String(req.body.password || "");
+    if (!password) return res.status(400).json({ success: false, message: "Admin password is required." });
+
+    const envUsername = cleanUsername(process.env.ADMIN_USERNAME);
+    const query = envUsername
+      ? { username: envUsername }
+      : { $or: [{ role: "admin" }, { isAdmin: true }] };
+    const admin = await User.findOne(query);
+
+    if (!admin || !(admin.role === "admin" || admin.isAdmin) || !(await bcrypt.compare(password, admin.password))) {
+      return res.status(401).json({ success: false, message: "Incorrect admin password." });
+    }
+
+    const token = makeToken(admin);
+    res.json({ success: true, message: "Admin verified.", token, user: publicUser(admin) });
+  } catch (error) {
+    console.error("ADMIN UNLOCK ERROR:", error);
+    res.status(500).json({ success: false, message: "Admin verification failed." });
+  }
 });
 
 /* =========================
@@ -742,7 +792,7 @@ app.post("/api/admin/results", auth, adminOnly, async (req, res) => {
     const current = await getResults();
     const next = current.map((r, i) =>
       Number(r.baji) === baji
-        ? { baji, patti, single, declared: true }
+        ? { baji, patti, single, declared: true, resultAt: String(r.resultAt || resultAtForBaji(baji)) }
         : { ...r, baji: Number(r.baji || i + 1) }
     );
 
@@ -970,7 +1020,7 @@ app.post("/api/admin/transfer", auth, adminOnly, async (req, res) => {
       return res.status(400).json({ success: false, message: "Username, valid amount and action are required." });
     }
 
-    const user = await User.findOne({ username: { $regex: new RegExp("^" + username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$", "i") } });
+    const user = await User.findOne({ username });
     if (!user) return res.status(404).json({ success: false, message: "User not found." });
 
     const current = Number(user.balance || 0);
@@ -1020,10 +1070,10 @@ async function ensureAdmin() {
     return;
   }
 
-  const hash = await bcrypt.hash(password, 12);
   const existing = await User.findOne({ username });
 
   if (!existing) {
+    const hash = await bcrypt.hash(password, 12);
     await User.create({
       username,
       email,
@@ -1037,7 +1087,16 @@ async function ensureAdmin() {
 
   existing.role = "admin";
   existing.isAdmin = true;
-  // Do not overwrite the existing password on every restart.
+  existing.email = email;
+
+  // Keep the Render ADMIN_PASSWORD authoritative, but only re-hash when
+  // the configured password is actually different from the stored hash.
+  const passwordMatches = await bcrypt.compare(password, existing.password);
+  if (!passwordMatches) {
+    existing.password = await bcrypt.hash(password, 12);
+    console.log("Admin password synchronized from environment variables.");
+  }
+
   await existing.save();
 }
 

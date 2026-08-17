@@ -898,6 +898,33 @@ app.get("/api/admin/withdrawals", auth, adminOnly, async (req, res) => {
   res.json({ success: true, requests });
 });
 
+// Compatibility aliases for older frontend builds.
+app.get("/api/admin/deposit-requests", auth, adminOnly, async (req, res) => {
+  const users = await User.find().select("username email depositHistory");
+  const requests = [];
+  for (const user of users) for (const item of user.depositHistory || []) {
+    if (String(item.status).toLowerCase() === "pending") requests.push({
+      id: item.id, username: user.username, email: user.email, amount: Number(item.amount || 0),
+      utr: item.utr || "", status: item.status, date: item.date
+    });
+  }
+  requests.sort((a,b)=>new Date(b.date)-new Date(a.date));
+  res.json({success:true, requests});
+});
+
+app.get("/api/admin/withdrawal-requests", auth, adminOnly, async (req, res) => {
+  const users = await User.find().select("username email withdrawalHistory");
+  const requests = [];
+  for (const user of users) for (const item of user.withdrawalHistory || []) {
+    if (String(item.status).toLowerCase() === "pending") requests.push({
+      id: item.id, username: user.username, email: user.email, amount: Number(item.amount || 0),
+      upi: item.upi || "", status: item.status, date: item.date
+    });
+  }
+  requests.sort((a,b)=>new Date(b.date)-new Date(a.date));
+  res.json({success:true, requests});
+});
+
 async function findHistoryOwner(historyName, requestId) {
   const users = await User.find().select(historyName);
   for (const user of users) {
@@ -1020,7 +1047,7 @@ app.post("/api/admin/transfer", auth, adminOnly, async (req, res) => {
       return res.status(400).json({ success: false, message: "Username, valid amount and action are required." });
     }
 
-    const user = await User.findOne({ username });
+    const user = await User.findOne({ username: { $regex: new RegExp("^" + username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$", "i") } });
     if (!user) return res.status(404).json({ success: false, message: "User not found." });
 
     const current = Number(user.balance || 0);

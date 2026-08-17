@@ -354,7 +354,7 @@ app.get("/api/auth/me", auth, async (req, res) => {
   res.json({ success: true, user: publicUser(user) });
 });
 
-app.post("/api/admin/unlock", async (req, res) => {
+async function adminUnlockHandler(req, res) {
   try {
     const password = String(req.body.password || "");
     if (!password) return res.status(400).json({ success: false, message: "Admin password is required." });
@@ -375,7 +375,12 @@ app.post("/api/admin/unlock", async (req, res) => {
     console.error("ADMIN UNLOCK ERROR:", error);
     res.status(500).json({ success: false, message: "Admin verification failed." });
   }
-});
+}
+
+// Canonical admin unlock endpoint + aliases for older hosted HTML builds.
+app.post("/api/admin/unlock", adminUnlockHandler);
+app.post("/api/admin/verify", adminUnlockHandler);
+app.post("/admin/unlock", adminUnlockHandler);
 
 /* =========================
    PASSWORD RESET

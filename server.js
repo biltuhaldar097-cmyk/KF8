@@ -794,10 +794,6 @@ app.post("/api/admin/latest-results", auth, adminOnly, async (req, res) => {
    ADMIN DATA
 ========================= */
 
-app.get("/api/admin/check", auth, adminOnly, async (req, res) => {
-  res.json({ success: true, admin: true, username: req.auth.username || null });
-});
-
 app.get("/api/admin/users", auth, adminOnly, async (req, res) => {
   const users = await User.find().select("-password -resetOtpHash -resetOtpExpires").sort({ createdAt: -1 });
   res.json({ success: true, totalUsers: users.length, users: users.map(publicUser) });
@@ -974,7 +970,7 @@ app.post("/api/admin/transfer", auth, adminOnly, async (req, res) => {
       return res.status(400).json({ success: false, message: "Username, valid amount and action are required." });
     }
 
-    const user = await User.findOne({ username: { $regex: `^${username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, $options: "i" } });
+    const user = await User.findOne({ username: { $regex: new RegExp("^" + username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$", "i") } });
     if (!user) return res.status(404).json({ success: false, message: "User not found." });
 
     const current = Number(user.balance || 0);
@@ -1024,10 +1020,10 @@ async function ensureAdmin() {
     return;
   }
 
+  const hash = await bcrypt.hash(password, 12);
   const existing = await User.findOne({ username });
 
   if (!existing) {
-    const hash = await bcrypt.hash(password, 12);
     await User.create({
       username,
       email,
@@ -1041,16 +1037,7 @@ async function ensureAdmin() {
 
   existing.role = "admin";
   existing.isAdmin = true;
-  existing.email = email;
-
-  // Keep the Render ADMIN_PASSWORD authoritative, but only re-hash when
-  // the configured password is actually different from the stored hash.
-  const passwordMatches = await bcrypt.compare(password, existing.password);
-  if (!passwordMatches) {
-    existing.password = await bcrypt.hash(password, 12);
-    console.log("Admin password synchronized from environment variables.");
-  }
-
+  // Do not overwrite the existing password on every restart.
   await existing.save();
 }
 

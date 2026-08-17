@@ -954,10 +954,15 @@ app.post("/api/admin/deposits/:requestId", auth, adminOnly, async (req, res) => 
       return res.status(409).json({ success: false, message: "Deposit request already processed." });
     }
 
+    // Older user documents may not contain transactionHistory. Initialize it
+    // before touching it so demo deposit approval cannot fail with a 500.
+    if (!Array.isArray(user.transactionHistory)) user.transactionHistory = [];
+    if (!Array.isArray(user.depositHistory)) user.depositHistory = [];
+
     if (action === "approve") {
       user.balance = Number((Number(user.balance || 0) + Number(item.amount || 0)).toFixed(2));
       item.status = "Approved";
-      item.details = "Deposit approved by admin";
+      item.details = "Demo deposit approved by admin";
       item.reviewedAt = new Date();
 
       const tx = user.transactionHistory.find(x => String(x.id) === String(item.id));
@@ -967,7 +972,7 @@ app.post("/api/admin/deposits/:requestId", auth, adminOnly, async (req, res) => 
       }
     } else {
       item.status = "Rejected";
-      item.details = "Deposit rejected by admin";
+      item.details = "Demo deposit rejected by admin";
       item.reviewedAt = new Date();
 
       const tx = user.transactionHistory.find(x => String(x.id) === String(item.id));

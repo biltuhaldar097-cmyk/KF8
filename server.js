@@ -18,10 +18,15 @@ if (!JWT_SECRET) {
 }
 
 app.set("trust proxy", 1);
+const allowedOrigins = String(process.env.ALLOWED_ORIGINS || "")
+  .split(",").map(x => x.trim()).filter(Boolean);
 app.use(cors({
-  origin: true,
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error("CORS origin denied"));
+  },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "Accept"],
+  allowedHeaders: ["Content-Type", "Authorization", "Accept", "Idempotency-Key"],
   credentials: false
 }));
 app.use(express.json({ limit: "1mb" }));
@@ -70,6 +75,71 @@ const betSchema = new mongoose.Schema(
 );
 
 const Bet = mongoose.models.KF8Bet || mongoose.model("KF8Bet", betSchema);
+
+/* =========================
+   DEMO LEDGER + AUDIT
+   Virtual/demo points only.
+========================= */
+const ledgerSchema = new mongoose.Schema({
+  eventKey: { type: String, required: true, unique: true, index: true },
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+  username: { type: String, required: true, index: true },
+  type: { type: String, required: true },
+  amount: { type: Number, required: true },
+  balanceBefore: { type: Number, required: true },
+  balanceAfter: { type: Number, required: true },
+  referenceId: { type: String, required: true, index: true },
+  metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
+  createdAt: { type: Date, default: Date.now, immutable: true }
+}, { versionKey: false });
+const Ledger = mongoose.models.KF8DemoLedger || mongoose.model("KF8DemoLedger", ledgerSchema);
+
+const auditSchema = new mongoose.Schema({
+  actorUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
+  actorUsername: { type: String, index: true },
+  action: { type: String, required: true, index: true },
+  targetUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
+  referenceId: { type: String, index: true },
+  ip: String,
+  userAgent: String,
+  details: { type: mongoose.Schema.Types.Mixed, default: {} },
+  createdAt: { type: Date, default: Date.now, immutable: true }
+}, { versionKey: false });
+const AuditLog = mongoose.models.KF8AuditLog || mongoose.model("KF8AuditLog", auditSchema);
+
+async function recordLedger(user, type, delta, referenceId, metadata = {}) {
+  const amount = Number(delta || 0);
+  const after = Number(user.balance || 0);
+  const before = Number((after - amount).toFixed(2));
+  const eventKey = `${type}:${String(referenceId)}`;
+  try {
+    return await Ledger.create({
+      eventKey, userId: user._id, username: user.username, type,
+      amount: Number(amount.toFixed(2)), balanceBefore: before,
+      balanceAfter: after, referenceId: String(referenceId), metadata
+    });
+  } catch (err) {
+    if (err?.code === 11000) return Ledger.findOne({ eventKey }).lean();
+    throw err;
+  }
+}
+
+async function writeAudit(req, action, targetUser, referenceId, details = {}) {
+  try {
+    await AuditLog.create({
+      actorUserId: req.auth?.id,
+      actorUsername: req.auth?.username,
+      action,
+      targetUserId: targetUser?._id,
+      referenceId: referenceId ? String(referenceId) : undefined,
+      ip: String(req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim(),
+      userAgent: String(req.headers["user-agent"] || "").slice(0, 300),
+      details
+    });
+  } catch (err) {
+    console.error("AUDIT LOG ERROR:", err);
+  }
+}
 
 /* =========================
    REAL-TIME CONNECTIONS
@@ -144,11 +214,17 @@ function auth(req, res, next) {
   }
 }
 
-function adminOnly(req, res, next) {
-  if (req.auth?.role !== "admin") {
+async function adminOnly(req, res, next) {
+  try {
+    const user = await User.findById(req.auth?.id).select("_id username email role isAdmin");
+    if (!user || !(user.isAdmin || user.role === "admin")) {
+      return res.status(403).json({ success: false, message: "Admin access required." });
+    }
+    req.adminUser = user;
+    next();
+  } catch (_) {
     return res.status(403).json({ success: false, message: "Admin access required." });
   }
-  next();
 }
 
 function cleanEmail(value) {
@@ -533,6 +609,25 @@ app.get("/api/history", auth, async (req, res) => {
   res.json({ success: true, ...historyView(user) });
 });
 
+app.get("/api/ledger", auth, async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 200);
+  const entries = await Ledger.find({ userId: req.auth.id })
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .lean();
+  res.json({ success: true, entries });
+});
+
+app.get("/api/admin/audit-log", auth, adminOnly, async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
+  const entries = await AuditLog.find({})
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .lean();
+  res.json({ success: true, entries });
+});
+
+
 // Kept only as a compatibility route; it still requires the logged-in user.
 app.get("/history/:email", auth, async (req, res) => {
   const requested = cleanEmail(req.params.email);
@@ -552,8 +647,16 @@ app.post("/api/deposit", auth, async (req, res) => {
     const amount = cleanAmount(req.body.amount);
     const utr = String(req.body.utr || req.body.UTR || req.body.transactionId || "").trim();
 
-    if (!amount || utr.length < 6) {
-      return res.status(400).json({ success: false, message: "Valid amount and UTR are required." });
+    if (!amount || amount < 100 || utr.length < 6) {
+      return res.status(400).json({ success: false, message: "Minimum demo deposit is 100 PTS and a valid reference is required." });
+    }
+
+    const duplicateUtr = await User.findOne({
+      _id: req.auth.id,
+      depositHistory: { $elemMatch: { utr, status: { $in: ["Pending", "Approved"] } } }
+    }).lean();
+    if (duplicateUtr) {
+      return res.status(409).json({ success: false, message: "This demo deposit reference has already been used." });
     }
 
     const user = await User.findById(req.auth.id);
@@ -598,8 +701,8 @@ app.post("/api/withdrawal", auth, async (req, res) => {
     const amount = cleanAmount(req.body.amount);
     const upi = String(req.body.upi || req.body.upiId || "").trim();
 
-    if (!amount || !upi) {
-      return res.status(400).json({ success: false, message: "Valid amount and UPI ID are required." });
+    if (!amount || amount < 100 || !upi) {
+      return res.status(400).json({ success: false, message: "Minimum demo withdrawal is 100 PTS and a valid UPI ID is required." });
     }
 
     const user = await User.findById(req.auth.id);
@@ -607,6 +710,13 @@ app.post("/api/withdrawal", auth, async (req, res) => {
 
     if (Number(user.balance || 0) < amount) {
       return res.status(400).json({ success: false, message: "Insufficient balance." });
+    }
+
+    const pendingWithdrawal = (user.withdrawalHistory || []).find(
+      x => String(x.status).toLowerCase() === "pending"
+    );
+    if (pendingWithdrawal) {
+      return res.status(409).json({ success: false, message: "A demo withdrawal is already pending." });
     }
 
     user.balance = Number((Number(user.balance || 0) - amount).toFixed(2));
@@ -704,6 +814,9 @@ app.post("/api/bets", auth, async (req, res) => {
     });
 
     await user.save();
+    await recordLedger(user, "DEMO_BET", -stake, String(bet._id), {
+      baji, betType, target: rawTarget, demo: true
+    });
     await notifyUser(user);
 
     res.status(201).json({
@@ -777,6 +890,11 @@ async function settleBaji(baji, patti, single) {
     }
 
     await user.save();
+    if (won) {
+      await recordLedger(user, "DEMO_WIN", Number(bet.payout || 0), String(bet._id), {
+        baji: bet.baji, betType: bet.betType, result: bet.result, demo: true
+      });
+    }
     await bet.save();
     await notifyUser(user);
   }
@@ -950,19 +1068,16 @@ app.post("/api/admin/deposits/:requestId", auth, adminOnly, async (req, res) => 
     if (!found) return res.status(404).json({ success: false, message: "Deposit request not found." });
 
     const { user, item } = found;
+    if (!Array.isArray(user.transactionHistory)) user.transactionHistory = [];
+    if (!Array.isArray(user.depositHistory)) user.depositHistory = [];
     if (String(item.status).toLowerCase() !== "pending") {
       return res.status(409).json({ success: false, message: "Deposit request already processed." });
     }
 
-    // Older user documents may not contain transactionHistory. Initialize it
-    // before touching it so demo deposit approval cannot fail with a 500.
-    if (!Array.isArray(user.transactionHistory)) user.transactionHistory = [];
-    if (!Array.isArray(user.depositHistory)) user.depositHistory = [];
-
     if (action === "approve") {
       user.balance = Number((Number(user.balance || 0) + Number(item.amount || 0)).toFixed(2));
       item.status = "Approved";
-      item.details = "Demo deposit approved by admin";
+      item.details = "Deposit approved by admin";
       item.reviewedAt = new Date();
 
       const tx = user.transactionHistory.find(x => String(x.id) === String(item.id));
@@ -972,7 +1087,7 @@ app.post("/api/admin/deposits/:requestId", auth, adminOnly, async (req, res) => 
       }
     } else {
       item.status = "Rejected";
-      item.details = "Demo deposit rejected by admin";
+      item.details = "Deposit rejected by admin";
       item.reviewedAt = new Date();
 
       const tx = user.transactionHistory.find(x => String(x.id) === String(item.id));
@@ -983,6 +1098,14 @@ app.post("/api/admin/deposits/:requestId", auth, adminOnly, async (req, res) => 
     }
 
     await user.save();
+    if (action === "approve") {
+      await recordLedger(user, "DEMO_DEPOSIT", Number(item.amount || 0), String(item.id), {
+        utr: item.utr || "", demo: true
+      });
+    }
+    await writeAudit(req, `DEMO_DEPOSIT_${action.toUpperCase()}`, user, item.id, {
+      amount: Number(item.amount || 0), demo: true
+    });
     await notifyUser(user);
     broadcast("admin-data", { type: "deposit-processed" });
 
@@ -1004,6 +1127,8 @@ app.post("/api/admin/withdrawals/:requestId", auth, adminOnly, async (req, res) 
     if (!found) return res.status(404).json({ success: false, message: "Withdrawal request not found." });
 
     const { user, item } = found;
+    if (!Array.isArray(user.transactionHistory)) user.transactionHistory = [];
+    if (!Array.isArray(user.withdrawalHistory)) user.withdrawalHistory = [];
     if (String(item.status).toLowerCase() !== "pending") {
       return res.status(409).json({ success: false, message: "Withdrawal request already processed." });
     }
@@ -1033,6 +1158,14 @@ app.post("/api/admin/withdrawals/:requestId", auth, adminOnly, async (req, res) 
     }
 
     await user.save();
+    if (action === "reject") {
+      await recordLedger(user, "DEMO_WITHDRAWAL_REFUND", Number(item.amount || 0), String(item.id), {
+        reason: "Admin rejected demo withdrawal; balance refunded", demo: true
+      });
+    }
+    await writeAudit(req, `DEMO_WITHDRAWAL_${action.toUpperCase()}`, user, item.id, {
+      amount: Number(item.amount || 0), demo: true
+    });
     await notifyUser(user);
     broadcast("admin-data", { type: "withdrawal-processed" });
 
@@ -1080,11 +1213,21 @@ app.post("/api/admin/transfer", auth, adminOnly, async (req, res) => {
 
     user.transactionHistory.unshift(tx);
     await user.save();
+    await recordLedger(
+      user,
+      "DEMO_ADJUSTMENT",
+      action === "add" ? amount : -amount,
+      `admin-transfer:${tx.id}`,
+      { action, demo: true }
+    );
+    await writeAudit(req, `DEMO_BALANCE_${action.toUpperCase()}`, user, tx.id, {
+      amount, demo: true
+    });
     await notifyUser(user);
 
     res.json({
       success: true,
-      message: action === "add" ? "Balance added." : "Balance deducted.",
+      message: action === "add" ? "Demo balance added." : "Demo balance deducted.",
       user: publicUser(user)
     });
   } catch (error) {

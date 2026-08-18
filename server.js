@@ -1084,22 +1084,32 @@ app.post("/api/admin/deposits/:requestId", auth, adminOnly, async (req, res) => 
     const { user, item } = found;
     if (!Array.isArray(user.transactionHistory)) user.transactionHistory = [];
     if (!Array.isArray(user.depositHistory)) user.depositHistory = [];
-    if (String(item.status).toLowerCase() !== "pending") {
+    const currentStatus = String(item.status || "").toLowerCase();
+    // Idempotent demo admin action: a second click on an already-approved
+    // request must not add the amount a second time. It simply returns the
+    // current saved balance instead of showing a red "already processed" error.
+    if (currentStatus !== "pending") {
+      if (action === "approve" && currentStatus === "approved") {
+        return res.json({
+          success: true,
+          alreadyProcessed: true,
+          message: "Deposit already approved; no duplicate credit was added.",
+          user: publicUser(user),
+          request: item
+        });
+      }
       return res.status(409).json({ success: false, message: "Deposit request already processed." });
     }
 
     if (action === "approve") {
-      // Demo wallet: ALWAYS add the approved deposit to the existing balance.
-      // Example: 300 existing + 200 deposit = 500. Never overwrite the balance.
-      const currentBalance = Number(user.balance || 0);
-      const depositAmount = Number(item.amount || 0);
-      user.balance = Number((currentBalance + depositAmount).toFixed(2));
+      const before = Number(user.balance || 0);
+      const amount = Number(item.amount || 0);
+      // Demo points are additive: old balance is preserved and the approved
+      // deposit is added on top (e.g. 400 + 300 = 700).
+      user.balance = Number((before + amount).toFixed(2));
       item.status = "Approved";
       item.details = "Deposit approved by admin";
       item.reviewedAt = new Date();
-
-      // Keep the approved deposit in the user's history so it survives refresh.
-      // Do not remove it from depositHistory after approval.
 
       const tx = user.transactionHistory.find(x => String(x.id) === String(item.id));
       if (tx) {

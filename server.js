@@ -111,6 +111,8 @@ const resultSchema = new mongoose.Schema(
   {
     key: { type: String, unique: true, default: "main" },
     dayKey: { type: String, default: "" },
+    sourceUpdatedAt: { type: Date, default: null },
+    sourceName: { type: String, default: "" },
     results: {
       type: [
         {
@@ -402,6 +404,172 @@ async function notifyUser(user) {
 setInterval(() => {
   getResults().then(results => broadcast("results",{results})).catch(err => console.error("RESULT DAY ROLLOVER CHECK:",err.message));
 },60000).unref?.();
+
+
+/* =========================
+   AUTO RESULT MIRROR
+   Source: https://kolkataff.tv/
+   This mirrors published Patti + Single into Today's Result.
+   It intentionally does NOT settle/pay bets; settlement remains controlled
+   by the existing admin result route.
+========================= */
+
+const AUTO_RESULT_SOURCE_URL = "https://kolkataff.tv/";
+
+function stripHtml(value) {
+  return String(value || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function indiaDateWords() {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata",
+    day: "2-digit",
+    month: "long",
+    year: "numeric"
+  }).formatToParts(new Date());
+  const o = Object.fromEntries(parts.map(p => [p.type, p.value]));
+  return { day: String(Number(o.day)), month: o.month, year: o.year };
+}
+
+function parseKolkataFfTodayHtml(html) {
+  const beforeOld = String(html || "").split(/OLD\s+RESULTS/i)[0];
+  const visible = stripHtml(beforeOld);
+  const d = indiaDateWords();
+
+  // Do not import a stale/cached day.
+  const dateRegex = new RegExp(`\\b0?${d.day}\\s+${d.month}\\s+${d.year}\\b`, "i");
+  if (!dateRegex.test(visible)) {
+    throw new Error("Source page is not showing today's India date yet.");
+  }
+
+  // On the source page Today's Result is rendered as repeating H4 pairs:
+  // 3-digit Patti followed by 1-digit Single, up to 8 Bajis.
+  const values = [];
+  const h4Re = /<h4\b[^>]*>([\s\S]*?)<\/h4>/gi;
+  let match;
+  while ((match = h4Re.exec(beforeOld)) !== null) {
+    const text = stripHtml(match[1]).replace(/\s/g, "");
+    if (/^(?:\d{3}|\d|-)$/.test(text)) values.push(text);
+    if (values.length >= 16) break;
+  }
+
+  if (values.length < 2) {
+    throw new Error("Could not find today's result cells on source page.");
+  }
+
+  const rows = [];
+  for (let i = 0; i < Math.min(values.length, 16); i += 2) {
+    const patti = values[i];
+    const single = values[i + 1];
+    const baji = Math.floor(i / 2) + 1;
+    if (!single) break;
+    if (patti === "-" || single === "-") continue;
+    if (!/^\d{3}$/.test(patti) || !/^\d$/.test(single)) continue;
+    rows.push({
+      baji,
+      patti,
+      single,
+      declared: true,
+      resultAt: resultAtForBaji(baji)
+    });
+  }
+  return rows;
+}
+
+let autoResultSyncRunning = false;
+async function syncPublishedResultsFromKolkataFf() {
+  if (autoResultSyncRunning) return;
+  autoResultSyncRunning = true;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+    let response;
+    try {
+      response = await fetch(AUTO_RESULT_SOURCE_URL, {
+        signal: controller.signal,
+        redirect: "follow",
+        headers: {
+          "Accept": "text/html,application/xhtml+xml",
+          "User-Agent": "Mozilla/5.0 KF8-Result-Sync/1.0"
+        }
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!response.ok) throw new Error(`Source returned HTTP ${response.status}`);
+    const html = await response.text();
+    if (html.length > 2_000_000) throw new Error("Source response too large.");
+
+    const published = parseKolkataFfTodayHtml(html);
+    if (!published.length) return;
+
+    const current = await getResults();
+    const next = current.map(row => {
+      const incoming = published.find(x => Number(x.baji) === Number(row.baji));
+      return incoming ? incoming : row;
+    });
+
+    const changed = next.some((r, i) =>
+      Boolean(r.declared) !== Boolean(current[i]?.declared) ||
+      String(r.patti) !== String(current[i]?.patti) ||
+      String(r.single) !== String(current[i]?.single)
+    );
+    if (!changed) return;
+
+    const changedRows = next.filter((r, i) =>
+      Boolean(r.declared) &&
+      (
+        !Boolean(current[i]?.declared) ||
+        String(r.patti) !== String(current[i]?.patti) ||
+        String(r.single) !== String(current[i]?.single)
+      )
+    );
+
+    await Result.findOneAndUpdate(
+      { key: "main" },
+      {
+        $set: {
+          dayKey: currentGameDayKey(),
+          results: next,
+          sourceUpdatedAt: new Date(),
+          sourceName: "kolkataff.tv"
+        }
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    // Settle only newly published/changed Baji rows. Bets are Pending-only,
+    // so the same bet cannot be rewarded twice on repeated syncs.
+    let totalWinners = 0;
+    for (const row of changedRows) {
+      totalWinners += await settleBajiFromAutoSource(
+        Number(row.baji),
+        String(row.patti),
+        String(row.single)
+      );
+    }
+
+    broadcast("results", { results: next, source: "kolkataff.tv" });
+    broadcast("admin-data", { type: "auto-results-updated", source: "kolkataff.tv" });
+    console.log(`[AUTO RESULT] Mirrored ${published.length} published Baji result(s) from kolkataff.tv and settled ${totalWinners || 0} winner(s)`);
+  } catch (error) {
+    console.warn("[AUTO RESULT] Sync skipped:", error?.message || error);
+  } finally {
+    autoResultSyncRunning = false;
+  }
+}
+
+// Check periodically because the source publishes multiple results through the day.
+setInterval(syncPublishedResultsFromKolkataFf, 60 * 1000).unref?.();
+setTimeout(syncPublishedResultsFromKolkataFf, 10 * 1000).unref?.();
 
 /* =========================
    HEALTH
@@ -788,7 +956,9 @@ app.post("/api/deposit", auth, async (req, res) => {
       success: true,
       message: "Deposit request submitted.",
       request: item,
-      balance: Number(user.balance || 0)
+      balance: Number(user.balance || 0),
+      user: publicUser(user),
+      history: historyView(user)
     });
   } catch (error) {
     console.error("DEPOSIT ERROR:", error);
@@ -852,7 +1022,9 @@ app.post("/api/withdrawal", auth, async (req, res) => {
       success: true,
       message: "Withdrawal request submitted.",
       request: item,
-      balance: Number(user.balance || 0)
+      balance: Number(user.balance || 0),
+      user: publicUser(user),
+      history: historyView(user)
     });
   } catch (error) {
     console.error("WITHDRAW ERROR:", error);
@@ -932,7 +1104,7 @@ app.post("/api/bets", auth, async (req, res) => {
       username: user.username,
       baji,
       gameDay: currentGameDayKey(),
-      betType:
+      betType,
       rawTarget,
       stake,
       multiplier,
@@ -969,7 +1141,8 @@ app.post("/api/bets", auth, async (req, res) => {
       success: true,
       message: "Bet placed.",
       bet,
-      user: publicUser(user)
+      user: publicUser(user),
+      history: historyView(user)
     });
   } catch (error) {
     console.error("BET ERROR:", error);
@@ -990,6 +1163,117 @@ app.get("/api/latest-results", async (req, res) => {
   const results = await getResults();
   res.json({ success: true, results });
 });
+
+app.get("/api/result-source-status", async (req, res) => {
+  const doc = await Result.findOne({ key: "main" }).select("dayKey sourceUpdatedAt sourceName results").lean();
+  res.json({
+    success: true,
+    source: doc?.sourceName || null,
+    sourceUpdatedAt: doc?.sourceUpdatedAt || null,
+    dayKey: doc?.dayKey || currentGameDayKey(),
+    publishedCount: Array.isArray(doc?.results) ? doc.results.filter(x => x.declared).length : 0
+  });
+});
+
+
+async function settleBajiFromAutoSource(baji, patti, single) {
+  const dayKey = currentGameDayKey();
+  const [y,m,d] = dayKey.split("-").map(Number);
+  const start = new Date(Date.UTC(y, m - 1, d, 2, 30, 0));
+  const end = new Date(start.getTime() + 86400000);
+
+  const bets = await Bet.find({
+    baji,
+    status: "Pending",
+    $or: [
+      { gameDay: dayKey },
+      { gameDay: { $in: ["", null] }, createdAt: { $gte: start, $lt: end } }
+    ]
+  });
+
+  let winners = 0;
+  for (const bet of bets) {
+    let won = false;
+    if (bet.betType === "single") won = String(bet.rawTarget) === String(single);
+    if (bet.betType === "patti") won = String(bet.rawTarget) === String(patti);
+    if (bet.betType === "jodi") won = false;
+
+    const user = await User.findById(bet.userId);
+    if (!user) continue;
+
+    const payout = Number(bet.payout || 0);
+
+    if (won) {
+      // Auto-source reward behaves exactly like a normal game win.
+      user.balance = Number((Number(user.balance || 0) + payout).toFixed(2));
+      user.winningBalance = Number((Number(user.winningBalance || 0) + payout).toFixed(2));
+      user.wins = Number(user.wins || 0) + 1;
+
+      bet.status = "WON";
+      bet.result = `${patti}/${single}`;
+      bet.settledAt = new Date();
+
+      const tx = (user.transactionHistory || []).find(x => String(x.id) === String(bet._id));
+      if (tx) {
+        tx.status = "WON";
+        tx.amount = payout;
+        tx.result = bet.result;
+        tx.settledAt = bet.settledAt;
+        tx.details = `Auto result win • ${bet.multiplier}x`;
+      }
+
+      const gx = (user.gameHistory || []).find(x => String(x.id) === String(bet._id));
+      if (gx) {
+        gx.status = "WON";
+        gx.amount = payout;
+        gx.result = bet.result;
+        gx.settledAt = bet.settledAt;
+        gx.details = `Auto result win • ${bet.multiplier}x`;
+      }
+
+      winners++;
+    } else {
+      user.losses = Number(user.losses || 0) + 1;
+
+      bet.status = "LOST";
+      bet.result = `${patti}/${single}`;
+      bet.settledAt = new Date();
+
+      const tx = (user.transactionHistory || []).find(x => String(x.id) === String(bet._id));
+      if (tx) {
+        tx.status = "LOST";
+        tx.result = bet.result;
+        tx.settledAt = bet.settledAt;
+        tx.details = "Auto result • Bet lost";
+      }
+
+      const gx = (user.gameHistory || []).find(x => String(x.id) === String(bet._id));
+      if (gx) {
+        gx.status = "LOST";
+        gx.result = bet.result;
+        gx.settledAt = bet.settledAt;
+        gx.details = "Auto result • Bet lost";
+      }
+    }
+
+    await user.save();
+
+    if (won) {
+      await recordLedger(user, "AUTO_WIN", payout, String(bet._id), {
+        baji: bet.baji,
+        betType: bet.betType,
+        result: bet.result,
+        source: "kolkataff.tv",
+        withdrawable: true
+      });
+    }
+
+    await bet.save();
+    await notifyUser(user);
+  }
+
+  return winners;
+}
 
 async function settleBaji(baji, patti, single) {
   const dayKey=currentGameDayKey();

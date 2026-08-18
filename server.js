@@ -617,10 +617,9 @@ async function syncPublishedResultsFromKolkataFf() {
 
 async function seedVerifiedAug18ResultsIfEmpty() {
   if (currentGameDayKey() !== "2026-08-18") return;
-  const current = await getResults();
-  if (current.some(r => r.declared)) return;
 
-  // Verified from the user's live kolkataff.tv screenshot on 18 Aug 2026.
+  // Exact values visible on the user's live kolkataff.tv screenshot
+  // at 18:51 IST on 18 Aug 2026. These replace stale/local demo values.
   const verified = [
     { baji:1, patti:"369", single:"8", declared:true, resultAt:resultAtForBaji(1) },
     { baji:2, patti:"134", single:"8", declared:true, resultAt:resultAtForBaji(2) },
@@ -630,27 +629,58 @@ async function seedVerifiedAug18ResultsIfEmpty() {
     { baji:6, patti:"678", single:"1", declared:true, resultAt:resultAtForBaji(6) }
   ];
 
-  const next = current.map(row => verified.find(v => v.baji === Number(row.baji)) || row);
+  const current = await getResults();
+
+  // Force-correct Baji 1-6. Baji 7/8 remain waiting until the live source
+  // publishes them. This removes the old 239/147/578/etc demo results.
+  const next = current.map(row => {
+    const exact = verified.find(v => v.baji === Number(row.baji));
+    if (exact) return exact;
+    if (Number(row.baji) >= 7) {
+      return {
+        baji:Number(row.baji),
+        patti:"---",
+        single:"-",
+        declared:false,
+        resultAt:resultAtForBaji(Number(row.baji))
+      };
+    }
+    return row;
+  });
+
+  const changedRows = verified.filter(v => {
+    const old = current.find(r => Number(r.baji) === v.baji);
+    return !old?.declared || String(old.patti) !== v.patti || String(old.single) !== v.single;
+  });
+
   await Result.findOneAndUpdate(
     { key:"main" },
-    { $set:{ dayKey:currentGameDayKey(), results:next, sourceUpdatedAt:new Date(), sourceName:"kolkataff.tv (verified)" } },
+    {
+      $set:{
+        dayKey:currentGameDayKey(),
+        results:next,
+        sourceUpdatedAt:new Date(),
+        sourceName:"kolkataff.tv (verified live screenshot)"
+      }
+    },
     { upsert:true, new:true }
   );
 
-  // Settle pending bets exactly once; settle function only sees Pending bets.
-  for (const row of verified) {
+  // Only currently Pending bets can settle, so this cannot pay the same bet twice.
+  for (const row of changedRows) {
     await settleBajiFromAutoSource(row.baji, row.patti, row.single);
   }
+
   broadcast("results", { results:next, source:"kolkataff.tv" });
 }
 
 // Check periodically because the source publishes multiple results through the day.
-setInterval(syncPublishedResultsFromKolkataFf, 30 * 1000).unref?.();
+setInterval(syncPublishedResultsFromKolkataFf, 15 * 1000).unref?.();
 setTimeout(() => {
   seedVerifiedAug18ResultsIfEmpty()
     .then(() => syncPublishedResultsFromKolkataFf())
     .catch(err => console.warn("[AUTO RESULT] startup:", err?.message || err));
-}, 3000).unref?.();
+}, 1500).unref?.();
 
 /* =========================
    HEALTH
@@ -1258,6 +1288,26 @@ app.get("/api/result-source-status", async (req, res) => {
     displayedCount: Array.isArray(doc?.results) ? doc.results.filter(x => x.declared).length : 0
   });
 });
+
+app.get("/api/live-result-sync-status", async (req, res) => {
+  const doc = await Result.findOne({ key:"main" })
+    .select("dayKey sourceUpdatedAt sourceName results")
+    .lean();
+  res.json({
+    success:true,
+    gameDay:currentGameDayKey(),
+    source:doc?.sourceName || null,
+    sourceUpdatedAt:doc?.sourceUpdatedAt || null,
+    lastCheck:autoResultLastCheck,
+    lastError:autoResultLastError || null,
+    displayed:(doc?.results || []).filter(r => r.declared).map(r => ({
+      baji:Number(r.baji),
+      patti:String(r.patti),
+      single:String(r.single)
+    }))
+  });
+});
+
 
 app.post("/api/admin/sync-source-results", auth, adminOnly, async (req, res) => {
   await syncPublishedResultsFromKolkataFf();

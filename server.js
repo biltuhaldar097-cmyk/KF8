@@ -1894,12 +1894,12 @@ async function startServer() {
     await mongoose.connect(process.env.MONGODB_URI);
     console.log("MongoDB connected successfully.");
 
-    await ensureAdmin();
-    await getResults();
-
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`KF8 Backend running on port ${PORT}`);
     });
+
+    await ensureAdmin();
+    await getResults();
   } catch (error) {
     console.error("STARTUP ERROR:", error.message);
     process.exit(1);

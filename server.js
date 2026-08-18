@@ -252,6 +252,8 @@ function publicUser(user) {
     isAdmin: Boolean(user.isAdmin || user.role === "admin"),
     pts: Number(user.balance || 0),
     balance: Number(user.balance || 0),
+    winningBalance: Number(user.winningBalance || 0),
+    withdrawableBalance: Number(user.winningBalance || 0),
     totalPredictions: Number(user.totalPredictions || 0),
     wins: Number(user.wins || 0),
     losses: Number(user.losses || 0),
@@ -382,6 +384,8 @@ function historyView(user) {
   );
   return {
     balance: Number(user.balance || 0),
+    winningBalance: Number(user.winningBalance || 0),
+    withdrawableBalance: Number(user.winningBalance || 0),
     // These arrays live on the MongoDB User document and are never deleted
     // after approval/rejection/settlement. Only their status is updated.
     depositHistory: newestFirst(user.depositHistory),
@@ -808,8 +812,8 @@ app.post("/api/withdrawal", auth, async (req, res) => {
     const user = await User.findById(req.auth.id);
     if (!user) return res.status(404).json({ success: false, message: "User not found." });
 
-    if (Number(user.balance || 0) < amount) {
-      return res.status(400).json({ success: false, message: "Insufficient balance." });
+    if (Number(user.winningBalance || 0) < amount) {
+      return res.status(400).json({ success:false, message:`Only winning balance can be withdrawn. Withdrawable balance: ₹${Number(user.winningBalance || 0).toFixed(2)}` });
     }
 
     const pendingWithdrawal = (user.withdrawalHistory || []).find(
@@ -820,6 +824,7 @@ app.post("/api/withdrawal", auth, async (req, res) => {
     }
 
     user.balance = Number((Number(user.balance || 0) - amount).toFixed(2));
+    user.winningBalance = Number((Number(user.winningBalance || 0) - amount).toFixed(2));
 
     if (!Array.isArray(user.withdrawalHistory)) user.withdrawalHistory = [];
     if (!Array.isArray(user.transactionHistory)) user.transactionHistory = [];
@@ -1008,6 +1013,7 @@ async function settleBaji(baji, patti, single) {
 
     if (won) {
       user.balance = Number((Number(user.balance || 0) + Number(bet.payout || 0)).toFixed(2));
+      user.winningBalance = Number((Number(user.winningBalance || 0) + Number(bet.payout || 0)).toFixed(2));
       user.wins = Number(user.wins || 0) + 1;
       bet.status = "WON";
       bet.result = `${patti}/${single}`;
@@ -1314,6 +1320,7 @@ app.post("/api/admin/withdrawals/:requestId", auth, adminOnly, async (req, res) 
 
     if (action === "reject") {
       user.balance = Number((Number(user.balance || 0) + Number(item.amount || 0)).toFixed(2));
+      user.winningBalance = Number((Number(user.winningBalance || 0) + Number(item.amount || 0)).toFixed(2));
       item.status = "Rejected";
       item.details = "Withdrawal rejected; amount refunded";
       item.reviewedAt = new Date();

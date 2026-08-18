@@ -7,6 +7,7 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
 const User = require("./user");
+const { chromium } = require("playwright");
 
 const app = express();
 const PORT = Number(process.env.PORT || 5000);
@@ -509,66 +510,100 @@ let autoResultLastError = "";
 let autoResultLastCheck = null;
 let autoResultLastCount = 0;
 
+async function readKolkataFfWithBrowser() {
+  let browser;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu"
+      ]
+    });
+
+    const context = await browser.newContext({
+      locale: "en-IN",
+      timezoneId: "Asia/Kolkata",
+      userAgent: "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 Chrome/140.0 Mobile Safari/537.36",
+      viewport: { width: 430, height: 932 }
+    });
+
+    const page = await context.newPage();
+
+    // Avoid cache/service-worker effects and force a fresh document.
+    await page.route("**/*", async route => {
+      const req = route.request();
+      const type = req.resourceType();
+
+      // We only need DOM/text. Skip heavy resources to keep Render usage low.
+      if (["image", "media", "font"].includes(type)) {
+        return route.abort();
+      }
+      return route.continue({
+        headers: {
+          ...req.headers(),
+          "Cache-Control": "no-cache, no-store, max-age=0",
+          "Pragma": "no-cache"
+        }
+      });
+    });
+
+    const urls = [
+      `https://kolkataff.tv/?kf8_browser=${Date.now()}`,
+      `https://www.kolkataff.tv/?kf8_browser=${Date.now()}`
+    ];
+
+    let lastError = "";
+    for (const url of urls) {
+      try {
+        await page.goto(url, {
+          waitUntil: "domcontentloaded",
+          timeout: 20000
+        });
+
+        // Give client-side rendering a short window to populate LIVE results.
+        await page.waitForTimeout(1800);
+
+        const html = await page.content();
+        if (html.length > 2_000_000) throw new Error("Rendered source page is too large.");
+
+        const parsed = parseKolkataFfTodayHtml(html);
+        if (parsed?.rows?.length) {
+          await context.close().catch(() => {});
+          return parsed;
+        }
+      } catch (err) {
+        lastError = String(err?.message || err);
+      }
+    }
+
+    throw new Error(lastError || "Rendered source did not contain valid current-day results.");
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
 async function syncPublishedResultsFromKolkataFf() {
   if (autoResultSyncRunning) return;
   autoResultSyncRunning = true;
   autoResultLastCheck = new Date();
+
   try {
-    let parsed = null;
-    let lastFetchError = "";
-    const urls = [
-      `https://kolkataff.tv/?kf8_refresh=${Date.now()}`,
-      `https://www.kolkataff.tv/?kf8_refresh=${Date.now()}`
-    ];
-
-    for (const sourceUrl of urls) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 12000);
-      try {
-        const response = await fetch(sourceUrl, {
-          signal: controller.signal,
-          redirect: "follow",
-          cache: "no-store",
-          headers: {
-            "Accept": "text/html,application/xhtml+xml",
-            "Cache-Control": "no-cache, no-store, max-age=0",
-            "Pragma": "no-cache",
-            "User-Agent": "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 Chrome/140.0 Mobile Safari/537.36"
-          }
-        });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const html = await response.text();
-        if (html.length > 2_000_000) throw new Error("Source response too large.");
-        parsed = parseKolkataFfTodayHtml(html);
-        if (parsed?.rows?.length) break;
-      } catch (err) {
-        lastFetchError = String(err?.message || err);
-      } finally {
-        clearTimeout(timer);
-      }
-    }
-
-    if (!parsed?.rows?.length) {
-      throw new Error(lastFetchError || "No valid current-day source response.");
-    }
-
+    const parsed = await readKolkataFfWithBrowser();
     const published = parsed.rows;
+
     autoResultLastCount = published.length;
     autoResultLastError = "";
     if (!published.length) return;
 
     const current = await getResults();
+
     const next = current.map(row => {
       const incoming = published.find(x => Number(x.baji) === Number(row.baji));
       return incoming ? incoming : row;
     });
-
-    const changed = next.some((r, i) =>
-      Boolean(r.declared) !== Boolean(current[i]?.declared) ||
-      String(r.patti) !== String(current[i]?.patti) ||
-      String(r.single) !== String(current[i]?.single)
-    );
-    if (!changed) return;
 
     const changedRows = next.filter((r, i) =>
       Boolean(r.declared) &&
@@ -579,6 +614,8 @@ async function syncPublishedResultsFromKolkataFf() {
       )
     );
 
+    if (!changedRows.length) return;
+
     await Result.findOneAndUpdate(
       { key: "main" },
       {
@@ -586,14 +623,14 @@ async function syncPublishedResultsFromKolkataFf() {
           dayKey: currentGameDayKey(),
           results: next,
           sourceUpdatedAt: new Date(),
-          sourceName: "kolkataff.tv"
+          sourceName: "kolkataff.tv (browser-rendered)"
         }
       },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
-    // Settle only newly published/changed Baji rows. Bets are Pending-only,
-    // so the same bet cannot be rewarded twice on repeated syncs.
+    // Existing settlement is Pending-only, so repeated browser checks
+    // cannot pay the same bet twice.
     let totalWinners = 0;
     for (const row of changedRows) {
       totalWinners += await settleBajiFromAutoSource(
@@ -605,82 +642,25 @@ async function syncPublishedResultsFromKolkataFf() {
 
     broadcast("results", { results: next, source: "kolkataff.tv" });
     broadcast("admin-data", { type: "auto-results-updated", source: "kolkataff.tv" });
-    console.log(`[AUTO RESULT] Mirrored ${published.length} published Baji result(s) from kolkataff.tv and settled ${totalWinners || 0} winner(s)`);
+
+    console.log(
+      `[AUTO RESULT] Browser sync updated ${changedRows.length} Baji result(s), ${totalWinners || 0} winner(s).`
+    );
   } catch (error) {
     autoResultLastError = String(error?.message || error);
-    console.warn("[AUTO RESULT] Sync skipped:", autoResultLastError);
+    console.warn("[AUTO RESULT] Browser sync skipped:", autoResultLastError);
   } finally {
     autoResultSyncRunning = false;
   }
 }
 
 
-async function seedVerifiedAug18ResultsIfEmpty() {
-  if (currentGameDayKey() !== "2026-08-18") return;
-
-  // Exact values visible on the user's live kolkataff.tv screenshot
-  // at 18:51 IST on 18 Aug 2026. These replace stale/local demo values.
-  const verified = [
-    { baji:1, patti:"369", single:"8", declared:true, resultAt:resultAtForBaji(1) },
-    { baji:2, patti:"134", single:"8", declared:true, resultAt:resultAtForBaji(2) },
-    { baji:3, patti:"370", single:"0", declared:true, resultAt:resultAtForBaji(3) },
-    { baji:4, patti:"499", single:"2", declared:true, resultAt:resultAtForBaji(4) },
-    { baji:5, patti:"680", single:"4", declared:true, resultAt:resultAtForBaji(5) },
-    { baji:6, patti:"678", single:"1", declared:true, resultAt:resultAtForBaji(6) }
-  ];
-
-  const current = await getResults();
-
-  // Force-correct Baji 1-6. Baji 7/8 remain waiting until the live source
-  // publishes them. This removes the old 239/147/578/etc demo results.
-  const next = current.map(row => {
-    const exact = verified.find(v => v.baji === Number(row.baji));
-    if (exact) return exact;
-    if (Number(row.baji) >= 7) {
-      return {
-        baji:Number(row.baji),
-        patti:"---",
-        single:"-",
-        declared:false,
-        resultAt:resultAtForBaji(Number(row.baji))
-      };
-    }
-    return row;
-  });
-
-  const changedRows = verified.filter(v => {
-    const old = current.find(r => Number(r.baji) === v.baji);
-    return !old?.declared || String(old.patti) !== v.patti || String(old.single) !== v.single;
-  });
-
-  await Result.findOneAndUpdate(
-    { key:"main" },
-    {
-      $set:{
-        dayKey:currentGameDayKey(),
-        results:next,
-        sourceUpdatedAt:new Date(),
-        sourceName:"kolkataff.tv (verified live screenshot)"
-      }
-    },
-    { upsert:true, new:true }
-  );
-
-  // Only currently Pending bets can settle, so this cannot pay the same bet twice.
-  for (const row of changedRows) {
-    await settleBajiFromAutoSource(row.baji, row.patti, row.single);
-  }
-
-  broadcast("results", { results:next, source:"kolkataff.tv" });
-}
-
 // Check periodically because the source publishes multiple results through the day.
-setInterval(syncPublishedResultsFromKolkataFf, 15 * 1000).unref?.();
+setInterval(syncPublishedResultsFromKolkataFf, 20 * 1000).unref?.();
 setTimeout(() => {
-  seedVerifiedAug18ResultsIfEmpty()
-    .then(() => syncPublishedResultsFromKolkataFf())
+  syncPublishedResultsFromKolkataFf()
     .catch(err => console.warn("[AUTO RESULT] startup:", err?.message || err));
-}, 1500).unref?.();
+}, 2500).unref?.();
 
 /* =========================
    HEALTH

@@ -1089,12 +1089,17 @@ app.post("/api/admin/deposits/:requestId", auth, adminOnly, async (req, res) => 
     }
 
     if (action === "approve") {
-      user.balance = Number((Number(user.balance || 0) + Number(item.amount || 0)).toFixed(2));
+      // Demo wallet: ALWAYS add the approved deposit to the existing balance.
+      // Example: 300 existing + 200 deposit = 500. Never overwrite the balance.
+      const currentBalance = Number(user.balance || 0);
+      const depositAmount = Number(item.amount || 0);
+      user.balance = Number((currentBalance + depositAmount).toFixed(2));
       item.status = "Approved";
       item.details = "Deposit approved by admin";
       item.reviewedAt = new Date();
 
-      user.depositHistory = user.depositHistory.filter(x => String(x.id) !== String(item.id));
+      // Keep the approved deposit in the user's history so it survives refresh.
+      // Do not remove it from depositHistory after approval.
 
       const tx = user.transactionHistory.find(x => String(x.id) === String(item.id));
       if (tx) {

@@ -1063,12 +1063,13 @@ app.get("/api/admin/withdrawal-requests", auth, adminOnly, async (req, res) => {
 });
 
 async function findHistoryOwner(historyName, requestId) {
-  const users = await User.find().select(historyName);
-  for (const user of users) {
-    const item = (user[historyName] || []).find(x => String(x.id) === String(requestId));
-    if (item) return { user, item };
-  }
-  return null;
+  // IMPORTANT: load the FULL user document. The old code selected only the
+  // history array, which made user.balance look like 0 during admin approval.
+  // That caused e.g. 400 + 300 to become 300.
+  const user = await User.findOne({ [`${historyName}.id`]: String(requestId) });
+  if (!user) return null;
+  const item = (user[historyName] || []).find(x => String(x.id) === String(requestId));
+  return item ? { user, item } : null;
 }
 
 app.post("/api/admin/deposits/:requestId", auth, adminOnly, async (req, res) => {

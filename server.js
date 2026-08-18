@@ -441,14 +441,10 @@ function indiaDateWords() {
 function parseKolkataFfTodayHtml(html) {
   const beforeOld = String(html || "").split(/OLD\s+RESULTS/i)[0];
   const visible = stripHtml(beforeOld);
-  const d = indiaDateWords();
 
-  // Do not import a stale/cached day.
-  const dateRegex = new RegExp(`\\b0?${d.day}\\s+${d.month}\\s+${d.year}\\b`, "i");
-  if (!dateRegex.test(visible)) {
-    throw new Error("Source page is not showing today's India date yet.");
-  }
-
+  // Mirror the source page's top LIVE/TODAY block exactly. We intentionally
+  // parse only content before "OLD RESULTS", so historical rows are never
+  // mixed into Today's Result even if the page heading/date format changes.
   // On the source page Today's Result is rendered as repeating H4 pairs:
   // 3-digit Patti followed by 1-digit Single, up to 8 Bajis.
   const values = [];
@@ -461,7 +457,18 @@ function parseKolkataFfTodayHtml(html) {
   }
 
   if (values.length < 2) {
-    throw new Error("Could not find today's result cells on source page.");
+    // Fallback for minor source HTML/template changes: pull result-looking
+    // tokens from the LIVE block only. Pairs remain Patti(3-digit)+Single.
+    const candidates = visible.match(/(?:^|\s)(\d{3}|\d|-)(?=\s|$)/g) || [];
+    for (const token of candidates) {
+      const value = String(token).trim();
+      if (/^(?:\d{3}|\d|-)$/.test(value)) values.push(value);
+      if (values.length >= 16) break;
+    }
+  }
+
+  if (values.length < 2) {
+    throw new Error("Could not find published result cells on source page.");
   }
 
   const rows = [];
@@ -484,20 +491,29 @@ function parseKolkataFfTodayHtml(html) {
 }
 
 let autoResultSyncRunning = false;
+let autoResultLastError = "";
+let autoResultLastCheck = null;
+let autoResultLastCount = 0;
+
 async function syncPublishedResultsFromKolkataFf() {
   if (autoResultSyncRunning) return;
   autoResultSyncRunning = true;
+  autoResultLastCheck = new Date();
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 12000);
     let response;
     try {
-      response = await fetch(AUTO_RESULT_SOURCE_URL, {
+      const sourceUrl = `${AUTO_RESULT_SOURCE_URL}?kf8_refresh=${Date.now()}`;
+      response = await fetch(sourceUrl, {
         signal: controller.signal,
         redirect: "follow",
+        cache: "no-store",
         headers: {
           "Accept": "text/html,application/xhtml+xml",
-          "User-Agent": "Mozilla/5.0 KF8-Result-Sync/1.0"
+          "Cache-Control": "no-cache, no-store, max-age=0",
+          "Pragma": "no-cache",
+          "User-Agent": "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 Chrome/140.0 Mobile Safari/537.36"
         }
       });
     } finally {
@@ -509,6 +525,8 @@ async function syncPublishedResultsFromKolkataFf() {
     if (html.length > 2_000_000) throw new Error("Source response too large.");
 
     const published = parseKolkataFfTodayHtml(html);
+    autoResultLastCount = published.length;
+    autoResultLastError = "";
     if (!published.length) return;
 
     const current = await getResults();
@@ -561,15 +579,16 @@ async function syncPublishedResultsFromKolkataFf() {
     broadcast("admin-data", { type: "auto-results-updated", source: "kolkataff.tv" });
     console.log(`[AUTO RESULT] Mirrored ${published.length} published Baji result(s) from kolkataff.tv and settled ${totalWinners || 0} winner(s)`);
   } catch (error) {
-    console.warn("[AUTO RESULT] Sync skipped:", error?.message || error);
+    autoResultLastError = String(error?.message || error);
+    console.warn("[AUTO RESULT] Sync skipped:", autoResultLastError);
   } finally {
     autoResultSyncRunning = false;
   }
 }
 
 // Check periodically because the source publishes multiple results through the day.
-setInterval(syncPublishedResultsFromKolkataFf, 60 * 1000).unref?.();
-setTimeout(syncPublishedResultsFromKolkataFf, 10 * 1000).unref?.();
+setInterval(syncPublishedResultsFromKolkataFf, 30 * 1000).unref?.();
+setTimeout(syncPublishedResultsFromKolkataFf, 5 * 1000).unref?.();
 
 /* =========================
    HEALTH
@@ -1168,10 +1187,25 @@ app.get("/api/result-source-status", async (req, res) => {
   const doc = await Result.findOne({ key: "main" }).select("dayKey sourceUpdatedAt sourceName results").lean();
   res.json({
     success: true,
-    source: doc?.sourceName || null,
+    source: doc?.sourceName || "kolkataff.tv",
     sourceUpdatedAt: doc?.sourceUpdatedAt || null,
+    lastCheck: autoResultLastCheck,
+    lastError: autoResultLastError || null,
+    sourcePublishedCount: autoResultLastCount,
     dayKey: doc?.dayKey || currentGameDayKey(),
-    publishedCount: Array.isArray(doc?.results) ? doc.results.filter(x => x.declared).length : 0
+    displayedCount: Array.isArray(doc?.results) ? doc.results.filter(x => x.declared).length : 0
+  });
+});
+
+app.post("/api/admin/sync-source-results", auth, adminOnly, async (req, res) => {
+  await syncPublishedResultsFromKolkataFf();
+  const results = await getResults();
+  res.json({
+    success: !autoResultLastError,
+    message: autoResultLastError ? `Source sync failed: ${autoResultLastError}` : "Source results synced.",
+    results,
+    lastCheck: autoResultLastCheck,
+    sourcePublishedCount: autoResultLastCount
   });
 });
 

@@ -242,7 +242,7 @@ function cleanAmount(value) {
 
 const BAJI_RESULT_TIMES = {
   1: "10:05",
-  2: "11:05",
+  2: "11:35",
   3: "13:05",
   4: "14:35",
   5: "16:05",
@@ -303,11 +303,17 @@ async function getResults() {
 }
 
 function historyView(user) {
+  const newestFirst = (rows) => Array.from(rows || []).sort((a, b) =>
+    new Date(b?.date || 0).getTime() - new Date(a?.date || 0).getTime()
+  );
   return {
     balance: Number(user.balance || 0),
-    depositHistory: user.depositHistory || [],
-    withdrawalHistory: user.withdrawalHistory || [],
-    transactionHistory: user.transactionHistory || []
+    // These arrays live on the MongoDB User document and are never deleted
+    // after approval/rejection/settlement. Only their status is updated.
+    depositHistory: newestFirst(user.depositHistory),
+    withdrawalHistory: newestFirst(user.withdrawalHistory),
+    gameHistory: newestFirst(user.gameHistory),
+    transactionHistory: newestFirst(user.transactionHistory)
   };
 }
 
@@ -662,6 +668,9 @@ app.post("/api/deposit", auth, async (req, res) => {
     const user = await User.findById(req.auth.id);
     if (!user) return res.status(404).json({ success: false, message: "User not found." });
 
+    if (!Array.isArray(user.depositHistory)) user.depositHistory = [];
+    if (!Array.isArray(user.transactionHistory)) user.transactionHistory = [];
+
     const requestId = new mongoose.Types.ObjectId().toString();
     const item = {
       id: requestId,
@@ -721,6 +730,9 @@ app.post("/api/withdrawal", auth, async (req, res) => {
 
     user.balance = Number((Number(user.balance || 0) - amount).toFixed(2));
 
+    if (!Array.isArray(user.withdrawalHistory)) user.withdrawalHistory = [];
+    if (!Array.isArray(user.transactionHistory)) user.transactionHistory = [];
+
     const requestId = new mongoose.Types.ObjectId().toString();
     // Deliberately do NOT store UTR/transactionId for withdrawals.
     const item = {
@@ -754,13 +766,30 @@ app.post("/api/withdrawal", auth, async (req, res) => {
 
 
 /* Game entry lock: block bets after closing time */
-function isGameClosed() {
-  const now = new Date();
-  const hour = now.getHours();
-  const minute = now.getMinutes();
-  // Default market close time: 9:00 PM local server time
-  const closeMinutes = 21 * 60;
-  return (hour * 60 + minute) >= closeMinutes;
+const BAJI_CLOSE_MINUTES = {
+  1: 10 * 60,
+  2: 11 * 60 + 30,
+  3: 13 * 60,
+  4: 14 * 60 + 30,
+  5: 16 * 60,
+  6: 17 * 60 + 30,
+  7: 19 * 60,
+  8: 20 * 60 + 30
+};
+
+function indiaClockMinutes() {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+  }).formatToParts(new Date());
+  const hour = Number(parts.find(p => p.type === "hour")?.value || 0);
+  const minute = Number(parts.find(p => p.type === "minute")?.value || 0);
+  return hour * 60 + minute;
+}
+
+function isGameClosed(baji) {
+  const closeMinutes = BAJI_CLOSE_MINUTES[Number(baji)];
+  if (!Number.isFinite(closeMinutes)) return true;
+  return indiaClockMinutes() >= closeMinutes;
 }
 
 /* =========================
@@ -769,10 +798,10 @@ function isGameClosed() {
 
 app.post("/api/bets", auth, async (req, res) => {
   try {
-    if (isGameClosed()) {
-      return res.status(403).json({ success: false, message: "Game closed. Entry is not allowed now." });
-    }
     const baji = Number(req.body.baji);
+    if (isGameClosed(baji)) {
+      return res.status(403).json({ success: false, message: `Baji ${baji} is closed. Entry is not allowed now.` });
+    }
     const betType = String(req.body.betType || "").toLowerCase();
     const rawTarget = String(req.body.rawTarget ?? req.body.target ?? "").trim();
     const stake = cleanAmount(req.body.stake);
@@ -813,7 +842,9 @@ app.post("/api/bets", auth, async (req, res) => {
       payout: Number((stake * multiplier).toFixed(2))
     });
 
-    user.transactionHistory.unshift({
+    if (!Array.isArray(user.transactionHistory)) user.transactionHistory = [];
+    if (!Array.isArray(user.gameHistory)) user.gameHistory = [];
+    const gameHistoryItem = {
       id: String(bet._id),
       type: "Bet Placed",
       amount: -stake,
@@ -825,7 +856,11 @@ app.post("/api/bets", auth, async (req, res) => {
       payout: bet.payout,
       details: `Kolkata FF 8 Baji ${baji}`,
       date: new Date()
-    });
+    };
+    // Store the same activity in the general ledger-style history and in a
+    // dedicated permanent game history for the user's profile.
+    user.transactionHistory.unshift(gameHistoryItem);
+    user.gameHistory.unshift({ ...gameHistoryItem });
 
     await user.save();
     await recordLedger(user, "DEMO_BET", -stake, String(bet._id), {
@@ -889,6 +924,12 @@ async function settleBaji(baji, patti, single) {
         tx.amount = Number(bet.payout || 0);
         tx.details = `Won ${bet.multiplier}x`;
       }
+      const gx = (user.gameHistory || []).find(x => String(x.id) === String(bet._id));
+      if (gx) {
+        gx.status = "WON";
+        gx.amount = Number(bet.payout || 0);
+        gx.details = `Won ${bet.multiplier}x`;
+      }
       winners++;
     } else {
       user.losses = Number(user.losses || 0) + 1;
@@ -900,6 +941,11 @@ async function settleBaji(baji, patti, single) {
       if (tx) {
         tx.status = "LOST";
         tx.details = "Bet lost";
+      }
+      const gx = (user.gameHistory || []).find(x => String(x.id) === String(bet._id));
+      if (gx) {
+        gx.status = "LOST";
+        gx.details = "Bet lost";
       }
     }
 

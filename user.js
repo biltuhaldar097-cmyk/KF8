@@ -14,9 +14,12 @@ const historyItemSchema = new mongoose.Schema(
     target: { type: String, default: undefined },
     stake: { type: Number, default: undefined },
     payout: { type: Number, default: undefined },
+    multiplier: { type: Number, default: undefined },
+    result: { type: String, default: undefined },
     details: { type: String, default: "" },
     date: { type: Date, default: Date.now },
-    reviewedAt: { type: Date, default: undefined }
+    reviewedAt: { type: Date, default: undefined },
+    settledAt: { type: Date, default: undefined }
   },
   { _id: false, minimize: false }
 );
@@ -93,6 +96,13 @@ const userSchema = new mongoose.Schema(
     },
 
     transactionHistory: {
+      type: [historyItemSchema],
+      default: []
+    },
+
+    // Permanent game/bet history for this user.
+    // Every placed game can be stored here and later updated to WON/LOST.
+    gameHistory: {
       type: [historyItemSchema],
       default: []
     },

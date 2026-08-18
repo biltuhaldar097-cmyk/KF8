@@ -502,8 +502,8 @@ app.post("/api/auth/forgot-password", async (req, res) => {
       body: JSON.stringify({
         from: process.env.RESET_FROM_EMAIL,
         to: [email],
-        subject: "KF8 password reset code",
-        text: `Your KF8 password reset code is ${otp}. It expires in 10 minutes.`
+        subject: "Kolkata FF 8 - Password Reset OTP",
+        text: `Your Kolkata FF 8 password reset OTP is ${otp}. This OTP expires in 10 minutes. If you did not request this, you can ignore this email.`
       })
     });
 
@@ -512,7 +512,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
       return res.status(502).json({ success: false, message: "Unable to send the reset email." });
     }
 
-    res.json({ success: true, message: "Verification code sent. Check your email." });
+    res.json({ success: true, message: "6-digit OTP sent to your registered Gmail. It expires in 10 minutes." });
   } catch (error) {
     console.error("FORGOT PASSWORD ERROR:", error);
     res.status(500).json({ success: false, message: "Password recovery failed." });

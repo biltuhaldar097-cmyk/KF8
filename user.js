@@ -14,12 +14,9 @@ const historyItemSchema = new mongoose.Schema(
     target: { type: String, default: undefined },
     stake: { type: Number, default: undefined },
     payout: { type: Number, default: undefined },
-    multiplier: { type: Number, default: undefined },
-    result: { type: String, default: undefined },
     details: { type: String, default: "" },
     date: { type: Date, default: Date.now },
-    reviewedAt: { type: Date, default: undefined },
-    settledAt: { type: Date, default: undefined }
+    reviewedAt: { type: Date, default: undefined }
   },
   { _id: false, minimize: false }
 );
@@ -100,8 +97,8 @@ const userSchema = new mongoose.Schema(
       default: []
     },
 
-    // Permanent game/bet history for this user.
-    // Every placed game can be stored here and later updated to WON/LOST.
+    // Permanent per-user game/bet activity. Kept separately so wallet
+    // history and game history can never overwrite/hide each other.
     gameHistory: {
       type: [historyItemSchema],
       default: []

@@ -752,12 +752,26 @@ app.post("/api/withdrawal", auth, async (req, res) => {
   }
 });
 
+
+/* Game entry lock: block bets after closing time */
+function isGameClosed() {
+  const now = new Date();
+  const hour = now.getHours();
+  const minute = now.getMinutes();
+  // Default market close time: 9:00 PM local server time
+  const closeMinutes = 21 * 60;
+  return (hour * 60 + minute) >= closeMinutes;
+}
+
 /* =========================
    BETS
 ========================= */
 
 app.post("/api/bets", auth, async (req, res) => {
   try {
+    if (isGameClosed()) {
+      return res.status(403).json({ success: false, message: "Game closed. Entry is not allowed now." });
+    }
     const baji = Number(req.body.baji);
     const betType = String(req.body.betType || "").toLowerCase();
     const rawTarget = String(req.body.rawTarget ?? req.body.target ?? "").trim();
@@ -1169,7 +1183,7 @@ app.post("/api/admin/withdrawals/:requestId", auth, adminOnly, async (req, res) 
     await notifyUser(user);
     broadcast("admin-data", { type: "withdrawal-processed" });
 
-    res.json({ success: true, message: `Withdrawal ${action}ed.`, user: publicUser(user), request: item });
+    res.json({ success: true, message: action === "approve" ? "Withdrawal approved." : "Withdrawal rejected.", user: publicUser(user), request: item });
   } catch (error) {
     console.error("ADMIN WITHDRAWAL ERROR:", error);
     res.status(500).json({ success: false, message: "Withdrawal processing failed." });

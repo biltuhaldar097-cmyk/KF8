@@ -51,6 +51,13 @@ const userSchema = new mongoose.Schema(
       min: 0
     },
 
+    // Only rewards won from games are withdrawable.
+    winningBalance: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+
     isAdmin: {
       type: Boolean,
       default: false

@@ -438,47 +438,57 @@ function indiaDateWords() {
   return { day: String(Number(o.day)), month: o.month, year: o.year };
 }
 
-function parseKolkataFfTodayHtml(html) {
-  const beforeOld = String(html || "").split(/OLD\s+RESULTS/i)[0];
-  const visible = stripHtml(beforeOld);
+function sourceIndiaDateKeyFromHtml(html) {
+  const live = String(html || "").split(/OLD\s+RESULTS/i)[0];
+  const text = stripHtml(live);
+  const m = text.match(/\b(\d{1,2})\s+(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)\s+(\d{4})\b/i);
+  if (!m) return "";
+  const months = {
+    JANUARY:"01",FEBRUARY:"02",MARCH:"03",APRIL:"04",MAY:"05",JUNE:"06",
+    JULY:"07",AUGUST:"08",SEPTEMBER:"09",OCTOBER:"10",NOVEMBER:"11",DECEMBER:"12"
+  };
+  return `${m[3]}-${months[m[2].toUpperCase()]}-${String(Number(m[1])).padStart(2,"0")}`;
+}
 
-  // Mirror the source page's top LIVE/TODAY block exactly. We intentionally
-  // parse only content before "OLD RESULTS", so historical rows are never
-  // mixed into Today's Result even if the page heading/date format changes.
-  // On the source page Today's Result is rendered as repeating H4 pairs:
-  // 3-digit Patti followed by 1-digit Single, up to 8 Bajis.
+function parseKolkataFfTodayHtml(html) {
+  const raw = String(html || "");
+  const beforeOld = raw.split(/OLD\s+RESULTS/i)[0];
+  const sourceDay = sourceIndiaDateKeyFromHtml(beforeOld);
+  const gameDay = currentGameDayKey();
+
+  // Critical protection: stale CDN/server pages must NEVER overwrite today's
+  // results. This was the reason old/wrong numbers could enter the site.
+  if (!sourceDay || sourceDay !== gameDay) {
+    throw new Error(`Source is stale (${sourceDay || "unknown"}), expected ${gameDay}.`);
+  }
+
+  // Limit parsing to the result area: after today's date heading and before
+  // the source's Refresh button / old result section.
+  let liveBlock = beforeOld;
+  const dateHeading = liveBlock.search(/<h3\b[^>]*>[\s\S]*?\d{1,2}\s+[A-Za-z]+\s+\d{4}[\s\S]*?<\/h3>/i);
+  if (dateHeading >= 0) liveBlock = liveBlock.slice(dateHeading);
+  const refreshAt = liveBlock.search(/Refresh\s*Karo/i);
+  if (refreshAt > 0) liveBlock = liveBlock.slice(0, refreshAt);
+
+  // Current source renders Patti and Single as H4 values.
   const values = [];
   const h4Re = /<h4\b[^>]*>([\s\S]*?)<\/h4>/gi;
   let match;
-  while ((match = h4Re.exec(beforeOld)) !== null) {
-    const text = stripHtml(match[1]).replace(/\s/g, "");
-    if (/^(?:\d{3}|\d|-)$/.test(text)) values.push(text);
+  while ((match = h4Re.exec(liveBlock)) !== null) {
+    const value = stripHtml(match[1]).replace(/\s/g, "");
+    if (/^(?:\d{3}|\d|-)$/.test(value)) values.push(value);
     if (values.length >= 16) break;
   }
 
-  if (values.length < 2) {
-    // Fallback for minor source HTML/template changes: pull result-looking
-    // tokens from the LIVE block only. Pairs remain Patti(3-digit)+Single.
-    const candidates = visible.match(/(?:^|\s)(\d{3}|\d|-)(?=\s|$)/g) || [];
-    for (const token of candidates) {
-      const value = String(token).trim();
-      if (/^(?:\d{3}|\d|-)$/.test(value)) values.push(value);
-      if (values.length >= 16) break;
-    }
-  }
-
-  if (values.length < 2) {
-    throw new Error("Could not find published result cells on source page.");
-  }
-
   const rows = [];
-  for (let i = 0; i < Math.min(values.length, 16); i += 2) {
+  for (let i = 0, baji = 1; i + 1 < values.length && baji <= 8; i += 2, baji++) {
     const patti = values[i];
     const single = values[i + 1];
-    const baji = Math.floor(i / 2) + 1;
-    if (!single) break;
+
+    // "-" means that source slot has not published a result yet.
     if (patti === "-" || single === "-") continue;
     if (!/^\d{3}$/.test(patti) || !/^\d$/.test(single)) continue;
+
     rows.push({
       baji,
       patti,
@@ -487,7 +497,11 @@ function parseKolkataFfTodayHtml(html) {
       resultAt: resultAtForBaji(baji)
     });
   }
-  return rows;
+
+  if (!rows.length) {
+    throw new Error("No published result pairs found in today's LIVE block.");
+  }
+  return { sourceDay, rows };
 }
 
 let autoResultSyncRunning = false;
@@ -500,31 +514,45 @@ async function syncPublishedResultsFromKolkataFf() {
   autoResultSyncRunning = true;
   autoResultLastCheck = new Date();
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 12000);
-    let response;
-    try {
-      const sourceUrl = `${AUTO_RESULT_SOURCE_URL}?kf8_refresh=${Date.now()}`;
-      response = await fetch(sourceUrl, {
-        signal: controller.signal,
-        redirect: "follow",
-        cache: "no-store",
-        headers: {
-          "Accept": "text/html,application/xhtml+xml",
-          "Cache-Control": "no-cache, no-store, max-age=0",
-          "Pragma": "no-cache",
-          "User-Agent": "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 Chrome/140.0 Mobile Safari/537.36"
-        }
-      });
-    } finally {
-      clearTimeout(timer);
+    let parsed = null;
+    let lastFetchError = "";
+    const urls = [
+      `https://kolkataff.tv/?kf8_refresh=${Date.now()}`,
+      `https://www.kolkataff.tv/?kf8_refresh=${Date.now()}`
+    ];
+
+    for (const sourceUrl of urls) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 12000);
+      try {
+        const response = await fetch(sourceUrl, {
+          signal: controller.signal,
+          redirect: "follow",
+          cache: "no-store",
+          headers: {
+            "Accept": "text/html,application/xhtml+xml",
+            "Cache-Control": "no-cache, no-store, max-age=0",
+            "Pragma": "no-cache",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 Chrome/140.0 Mobile Safari/537.36"
+          }
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const html = await response.text();
+        if (html.length > 2_000_000) throw new Error("Source response too large.");
+        parsed = parseKolkataFfTodayHtml(html);
+        if (parsed?.rows?.length) break;
+      } catch (err) {
+        lastFetchError = String(err?.message || err);
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
-    if (!response.ok) throw new Error(`Source returned HTTP ${response.status}`);
-    const html = await response.text();
-    if (html.length > 2_000_000) throw new Error("Source response too large.");
+    if (!parsed?.rows?.length) {
+      throw new Error(lastFetchError || "No valid current-day source response.");
+    }
 
-    const published = parseKolkataFfTodayHtml(html);
+    const published = parsed.rows;
     autoResultLastCount = published.length;
     autoResultLastError = "";
     if (!published.length) return;
@@ -586,9 +614,43 @@ async function syncPublishedResultsFromKolkataFf() {
   }
 }
 
+
+async function seedVerifiedAug18ResultsIfEmpty() {
+  if (currentGameDayKey() !== "2026-08-18") return;
+  const current = await getResults();
+  if (current.some(r => r.declared)) return;
+
+  // Verified from the user's live kolkataff.tv screenshot on 18 Aug 2026.
+  const verified = [
+    { baji:1, patti:"369", single:"8", declared:true, resultAt:resultAtForBaji(1) },
+    { baji:2, patti:"134", single:"8", declared:true, resultAt:resultAtForBaji(2) },
+    { baji:3, patti:"370", single:"0", declared:true, resultAt:resultAtForBaji(3) },
+    { baji:4, patti:"499", single:"2", declared:true, resultAt:resultAtForBaji(4) },
+    { baji:5, patti:"680", single:"4", declared:true, resultAt:resultAtForBaji(5) },
+    { baji:6, patti:"678", single:"1", declared:true, resultAt:resultAtForBaji(6) }
+  ];
+
+  const next = current.map(row => verified.find(v => v.baji === Number(row.baji)) || row);
+  await Result.findOneAndUpdate(
+    { key:"main" },
+    { $set:{ dayKey:currentGameDayKey(), results:next, sourceUpdatedAt:new Date(), sourceName:"kolkataff.tv (verified)" } },
+    { upsert:true, new:true }
+  );
+
+  // Settle pending bets exactly once; settle function only sees Pending bets.
+  for (const row of verified) {
+    await settleBajiFromAutoSource(row.baji, row.patti, row.single);
+  }
+  broadcast("results", { results:next, source:"kolkataff.tv" });
+}
+
 // Check periodically because the source publishes multiple results through the day.
 setInterval(syncPublishedResultsFromKolkataFf, 30 * 1000).unref?.();
-setTimeout(syncPublishedResultsFromKolkataFf, 5 * 1000).unref?.();
+setTimeout(() => {
+  seedVerifiedAug18ResultsIfEmpty()
+    .then(() => syncPublishedResultsFromKolkataFf())
+    .catch(err => console.warn("[AUTO RESULT] startup:", err?.message || err));
+}, 3000).unref?.();
 
 /* =========================
    HEALTH

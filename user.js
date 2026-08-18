@@ -114,9 +114,22 @@ const userSchema = new mongoose.Schema(
       type: Date,
       default: null,
       select: false
+    },
+
+    resetOtpAttempts: {
+      type: Number,
+      default: 0,
+      select: false
+    },
+
+    // Increment this to invalidate every previously issued JWT for the user.
+    tokenVersion: {
+      type: Number,
+      default: 0,
+      select: false
     }
   },
-  { timestamps: true }
+  { timestamps: true, optimisticConcurrency: true }
 );
 
 userSchema.pre("save", function(next) {

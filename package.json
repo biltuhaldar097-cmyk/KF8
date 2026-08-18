@@ -4,17 +4,19 @@
   "private": true,
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "postinstall": "playwright install chromium"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "dependencies": {
-    "bcrypt": "^5.1.1",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.21.2",
-    "jsonwebtoken": "^9.0.2",
-    "mongoose": "^8.9.5"
+    "bcrypt": "6.0.0",
+    "cors": "2.8.6",
+    "dotenv": "17.4.2",
+    "express": "4.22.2",
+    "jsonwebtoken": "9.0.3",
+    "mongoose": "8.24.2",
+    "playwright": "1.55.0"
   }
 }

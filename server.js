@@ -1094,6 +1094,8 @@ app.post("/api/admin/deposits/:requestId", auth, adminOnly, async (req, res) => 
       item.details = "Deposit approved by admin";
       item.reviewedAt = new Date();
 
+      user.depositHistory = user.depositHistory.filter(x => String(x.id) !== String(item.id));
+
       const tx = user.transactionHistory.find(x => String(x.id) === String(item.id));
       if (tx) {
         tx.status = "Approved";

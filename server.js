@@ -11,25 +11,97 @@ const User = require("./user");
 const app = express();
 const PORT = Number(process.env.PORT || 5000);
 const JWT_SECRET = process.env.JWT_SECRET;
+const NODE_ENV = String(process.env.NODE_ENV || "development").toLowerCase();
+const JWT_ISSUER = "kf8-api";
+const JWT_AUDIENCE = "kf8-web";
 
-if (!JWT_SECRET) {
-  console.error("JWT_SECRET is missing.");
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
+  console.error("JWT_SECRET is missing or too short. Use at least 32 random characters.");
   process.exit(1);
 }
 
+app.disable("x-powered-by");
 app.set("trust proxy", 1);
-const allowedOrigins = String(process.env.ALLOWED_ORIGINS || "")
-  .split(",").map(x => x.trim()).filter(Boolean);
+const allowedOrigins = String(process.env.ALLOWED_ORIGINS || "https://8f9b6f.netlify.app")
+  .split(",").map(x => x.trim().replace(/\/$/, "")).filter(Boolean);
+
+app.use((req, res, next) => {
+  // Security headers without extra npm dependencies.
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()");
+  res.setHeader("Cross-Origin-Resource-Policy", "same-site");
+  res.setHeader("X-DNS-Prefetch-Control", "off");
+  if (req.secure || String(req.headers["x-forwarded-proto"] || "").toLowerCase() === "https") {
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  }
+  if (/^\/api\/(auth|admin)/.test(req.path)) {
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    res.setHeader("Pragma", "no-cache");
+  }
+  next();
+});
+
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) return callback(null, true);
+    // Non-browser/server-to-server requests have no Origin header.
+    if (!origin) return callback(null, true);
+    const normalized = String(origin).replace(/\/$/, "");
+    if (allowedOrigins.includes(normalized)) return callback(null, true);
     return callback(new Error("CORS origin denied"));
   },
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "Accept", "Idempotency-Key"],
+  maxAge: 86400,
   credentials: false
 }));
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "64kb", strict: true }));
+
+function hasDangerousKeys(value) {
+  if (!value || typeof value !== "object") return false;
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "__proto__" || key === "prototype" || key === "constructor" || key.startsWith("$") || key.includes(".")) return true;
+    if (hasDangerousKeys(child)) return true;
+  }
+  return false;
+}
+app.use((req, res, next) => {
+  if (hasDangerousKeys(req.body)) return res.status(400).json({ success:false, message:"Invalid request payload." });
+  next();
+});
+
+// Small in-memory rate limiter. For multiple Render instances, move this to Redis.
+const rateBuckets = new Map();
+function rateLimit({ windowMs, max, keyPrefix="global" }) {
+  return (req, res, next) => {
+    const now = Date.now();
+    const ip = String(req.ip || req.socket?.remoteAddress || "unknown");
+    const key = `${keyPrefix}:${ip}`;
+    let row = rateBuckets.get(key);
+    if (!row || row.resetAt <= now) row = { count:0, resetAt:now + windowMs };
+    row.count += 1; rateBuckets.set(key, row);
+    res.setHeader("X-RateLimit-Limit", String(max));
+    res.setHeader("X-RateLimit-Remaining", String(Math.max(0, max-row.count)));
+    if (row.count > max) {
+      const retry = Math.max(1, Math.ceil((row.resetAt-now)/1000));
+      res.setHeader("Retry-After", String(retry));
+      return res.status(429).json({ success:false, message:"Too many requests. Please try again later." });
+    }
+    next();
+  };
+}
+const generalLimiter = rateLimit({ windowMs:60_000, max:240, keyPrefix:"general" });
+const loginLimiter = rateLimit({ windowMs:15*60_000, max:20, keyPrefix:"login" });
+const adminUnlockLimiter = rateLimit({ windowMs:15*60_000, max:8, keyPrefix:"admin-unlock" });
+const forgotLimiter = rateLimit({ windowMs:15*60_000, max:5, keyPrefix:"forgot" });
+const resetLimiter = rateLimit({ windowMs:15*60_000, max:10, keyPrefix:"reset" });
+app.use("/api", generalLimiter);
+setInterval(() => {
+  const now=Date.now();
+  for (const [k,v] of rateBuckets) if (v.resetAt <= now) rateBuckets.delete(k);
+  if (rateBuckets.size > 20000) rateBuckets.clear();
+}, 5*60_000).unref?.();
 
 /* =========================
    RESULT + BET MODELS
@@ -38,6 +110,7 @@ app.use(express.json({ limit: "1mb" }));
 const resultSchema = new mongoose.Schema(
   {
     key: { type: String, unique: true, default: "main" },
+    dayKey: { type: String, default: "" },
     results: {
       type: [
         {
@@ -61,6 +134,7 @@ const betSchema = new mongoose.Schema(
     userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
     username: { type: String, required: true },
     baji: { type: Number, required: true, min: 1, max: 8, index: true },
+    gameDay: { type: String, default: "", index: true },
     betType: { type: String, enum: ["single", "patti", "jodi"], required: true },
     rawTarget: { type: String, required: true },
     stake: { type: Number, required: true, min: 0.01 },
@@ -191,26 +265,29 @@ function makeToken(user) {
     {
       id: String(user._id),
       username: user.username,
-      role: user.role === "admin" || user.isAdmin ? "admin" : "user"
+      role: user.role === "admin" || user.isAdmin ? "admin" : "user",
+      v: Number(user.tokenVersion || 0)
     },
     JWT_SECRET,
-    { expiresIn: "7d" }
+    { expiresIn: "12h", algorithm:"HS256", issuer:JWT_ISSUER, audience:JWT_AUDIENCE }
   );
 }
 
-function auth(req, res, next) {
+async function auth(req, res, next) {
   const header = String(req.headers.authorization || "");
   const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
-
-  if (!token) {
-    return res.status(401).json({ success: false, message: "Authentication required." });
-  }
-
+  if (!token) return res.status(401).json({ success:false, message:"Authentication required." });
   try {
-    req.auth = jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(token, JWT_SECRET, { algorithms:["HS256"], issuer:JWT_ISSUER, audience:JWT_AUDIENCE });
+    const liveUser = await User.findById(decoded.id).select("_id username role isAdmin +tokenVersion");
+    if (!liveUser || Number(decoded.v || 0) !== Number(liveUser.tokenVersion || 0)) {
+      return res.status(401).json({ success:false, message:"Session expired. Please sign in again." });
+    }
+    req.auth = { ...decoded, role: liveUser.role === "admin" || liveUser.isAdmin ? "admin" : "user" };
+    req.authUser = liveUser;
     next();
   } catch (_) {
-    return res.status(401).json({ success: false, message: "Invalid or expired token." });
+    return res.status(401).json({ success:false, message:"Invalid or expired token." });
   }
 }
 
@@ -256,6 +333,20 @@ function resultAtForBaji(baji) {
   return value;
 }
 
+function indiaNowParts() {
+  const parts = new Intl.DateTimeFormat("en-CA", {timeZone:"Asia/Kolkata",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hourCycle:"h23"}).formatToParts(new Date());
+  const o = Object.fromEntries(parts.map(p => [p.type,p.value]));
+  return {year:+o.year,month:+o.month,day:+o.day,hour:+o.hour,minute:+o.minute};
+}
+function currentGameDayKey() {
+  const p=indiaNowParts(), d=new Date(Date.UTC(p.year,p.month-1,p.day));
+  if (p.hour < 8) d.setUTCDate(d.getUTCDate()-1);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,"0")}-${String(d.getUTCDate()).padStart(2,"0")}`;
+}
+function blankResults() {
+  return Array.from({length:8},(_,i)=>({baji:i+1,patti:"---",single:"-",declared:false,resultAt:resultAtForBaji(i+1)}));
+}
+
 function normalizeResults(results) {
   if (!Array.isArray(results)) return null;
   const rows = results.slice(0, 8).map((r, i) => ({
@@ -274,32 +365,15 @@ function normalizeResults(results) {
 }
 
 async function getResults() {
-  const doc = await Result.findOne({ key: "main" }).lean();
-  if (doc?.results?.length === 8) {
-    return doc.results.map((r, i) => ({
-      baji: Number(r.baji || i + 1),
-      patti: String(r.patti || "---"),
-      single: String(r.single || "-"),
-      declared: Boolean(r.declared),
-      resultAt: String(r.resultAt || resultAtForBaji(r.baji || i + 1))
-    }));
+  const dayKey=currentGameDayKey();
+  const doc=await Result.findOne({key:"main"}).lean();
+  if (!doc || doc.dayKey !== dayKey) {
+    const defaults=blankResults();
+    await Result.findOneAndUpdate({key:"main"},{$set:{dayKey,results:defaults}},{upsert:true,new:true,setDefaultsOnInsert:true});
+    return defaults;
   }
-
-  const defaults = Array.from({ length: 8 }, (_, i) => ({
-    baji: i + 1,
-    patti: "---",
-    single: "-",
-    declared: false,
-    resultAt: resultAtForBaji(i + 1)
-  }));
-
-  await Result.findOneAndUpdate(
-    { key: "main" },
-    { $set: { results: defaults } },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
-  );
-
-  return defaults;
+  const byBaji=new Map((doc.results||[]).map(r=>[Number(r.baji),r]));
+  return blankResults().map(f=>{const r=byBaji.get(f.baji); return !r?f:{baji:f.baji,patti:String(r.patti||"---"),single:String(r.single||"-"),declared:Boolean(r.declared),resultAt:String(r.resultAt||resultAtForBaji(f.baji))};});
 }
 
 function historyView(user) {
@@ -320,6 +394,10 @@ function historyView(user) {
 async function notifyUser(user) {
   sendEventToUser(user._id, "account", { user: publicUser(user), history: historyView(user) });
 }
+
+setInterval(() => {
+  getResults().then(results => broadcast("results",{results})).catch(err => console.error("RESULT DAY ROLLOVER CHECK:",err.message));
+},60000).unref?.();
 
 /* =========================
    HEALTH
@@ -356,8 +434,8 @@ async function registerHandler(req, res) {
       return res.status(400).json({ success: false, message: "Enter a valid email." });
     }
 
-    if (password.length < 8) {
-      return res.status(400).json({ success: false, message: "Password must be at least 8 characters." });
+    if (password.length < 10 || password.length > 128 || !/[A-Za-z]/.test(password) || !/\d/.test(password)) {
+      return res.status(400).json({ success:false, message:"Password must be 10-128 characters and include letters and a number." });
     }
 
     const existing = await User.findOne({
@@ -408,7 +486,7 @@ async function loginHandler(req, res) {
         { username: identity },
         { email: cleanEmail(identity) }
       ]
-    });
+    }).select("+tokenVersion");
 
     if (!user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({ success: false, message: "Invalid username/email or password." });
@@ -427,8 +505,8 @@ async function loginHandler(req, res) {
   }
 }
 
-app.post("/login", loginHandler);
-app.post("/api/auth/login", loginHandler);
+app.post("/login", loginLimiter, loginHandler);
+app.post("/api/auth/login", loginLimiter, loginHandler);
 
 app.get("/api/auth/me", auth, async (req, res) => {
   const user = await User.findById(req.auth.id);
@@ -445,7 +523,7 @@ async function adminUnlockHandler(req, res) {
     const query = envUsername
       ? { username: envUsername }
       : { $or: [{ role: "admin" }, { isAdmin: true }] };
-    const admin = await User.findOne(query);
+    const admin = await User.findOne(query).select("+tokenVersion");
 
     if (!admin || !(admin.role === "admin" || admin.isAdmin) || !(await bcrypt.compare(password, admin.password))) {
       return res.status(401).json({ success: false, message: "Incorrect admin password." });
@@ -460,15 +538,15 @@ async function adminUnlockHandler(req, res) {
 }
 
 // Canonical admin unlock endpoint + aliases for older hosted HTML builds.
-app.post("/api/admin/unlock", adminUnlockHandler);
-app.post("/api/admin/verify", adminUnlockHandler);
-app.post("/admin/unlock", adminUnlockHandler);
+app.post("/api/admin/unlock", adminUnlockLimiter, adminUnlockHandler);
+app.post("/api/admin/verify", adminUnlockLimiter, adminUnlockHandler);
+app.post("/admin/unlock", adminUnlockLimiter, adminUnlockHandler);
 
 /* =========================
    PASSWORD RESET
 ========================= */
 
-app.post("/api/auth/forgot-password", async (req, res) => {
+app.post("/api/auth/forgot-password", forgotLimiter, async (req, res) => {
   try {
     const email = cleanEmail(req.body.email);
     const user = await User.findOne({ email });
@@ -483,6 +561,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
 
     user.resetOtpHash = otpHash;
     user.resetOtpExpires = new Date(Date.now() + 10 * 60 * 1000);
+    user.resetOtpAttempts = 0;
     await user.save();
 
     if (!process.env.RESEND_API_KEY || !process.env.RESET_FROM_EMAIL) {
@@ -519,30 +598,40 @@ app.post("/api/auth/forgot-password", async (req, res) => {
   }
 });
 
-app.post("/api/auth/reset-password", async (req, res) => {
+app.post("/api/auth/reset-password", resetLimiter, async (req, res) => {
   try {
     const email = cleanEmail(req.body.email);
     const otp = String(req.body.otp || "").trim();
     const newPassword = String(req.body.newPassword || "");
 
-    if (!email || !/^\d{6}$/.test(otp) || newPassword.length < 8) {
-      return res.status(400).json({ success: false, message: "Invalid reset details." });
+    if (!email || !/^\d{6}$/.test(otp) || newPassword.length < 10 || newPassword.length > 128 || !/[A-Za-z]/.test(newPassword) || !/\d/.test(newPassword)) {
+      return res.status(400).json({ success:false, message:"Invalid reset details." });
     }
 
     const otpHash = crypto.createHash("sha256").update(otp).digest("hex");
-    const user = await User.findOne({
-      email,
-      resetOtpHash: otpHash,
-      resetOtpExpires: { $gt: new Date() }
-    }).select("+resetOtpHash +resetOtpExpires");
+    const user = await User.findOne({ email }).select("+resetOtpHash +resetOtpExpires +resetOtpAttempts +tokenVersion");
 
-    if (!user) {
-      return res.status(400).json({ success: false, message: "Invalid or expired verification code." });
+    const expired = !user?.resetOtpExpires || user.resetOtpExpires <= new Date();
+    const locked = Number(user?.resetOtpAttempts || 0) >= 5;
+    let matches = false;
+    if (user?.resetOtpHash && !expired && !locked) {
+      const a = Buffer.from(String(user.resetOtpHash), "hex");
+      const b = Buffer.from(String(otpHash), "hex");
+      matches = a.length === b.length && crypto.timingSafeEqual(a, b);
+    }
+    if (!user || expired || locked || !matches) {
+      if (user && !expired && !locked) {
+        user.resetOtpAttempts = Number(user.resetOtpAttempts || 0) + 1;
+        await user.save().catch(() => {});
+      }
+      return res.status(400).json({ success:false, message:"Invalid or expired verification code." });
     }
 
     user.password = await bcrypt.hash(newPassword, 12);
     user.resetOtpHash = null;
     user.resetOtpExpires = null;
+    user.resetOtpAttempts = 0;
+    user.tokenVersion = Number(user.tokenVersion || 0) + 1; // logout every existing session
     await user.save();
 
     res.json({ success: true, message: "Password reset successfully." });
@@ -562,7 +651,9 @@ app.get("/api/events", async (req, res) => {
 
   let decoded;
   try {
-    decoded = jwt.verify(token, JWT_SECRET);
+    decoded = jwt.verify(token, JWT_SECRET, { algorithms:["HS256"], issuer:JWT_ISSUER, audience:JWT_AUDIENCE });
+    const liveUser = await User.findById(decoded.id).select("_id +tokenVersion");
+    if (!liveUser || Number(decoded.v || 0) !== Number(liveUser.tokenVersion || 0)) return res.status(401).end();
   } catch (_) {
     return res.status(401).end();
   }
@@ -835,7 +926,8 @@ app.post("/api/bets", auth, async (req, res) => {
       userId: user._id,
       username: user.username,
       baji,
-      betType,
+      gameDay: currentGameDayKey(),
+      betType:
       rawTarget,
       stake,
       multiplier,
@@ -895,7 +987,10 @@ app.get("/api/latest-results", async (req, res) => {
 });
 
 async function settleBaji(baji, patti, single) {
-  const bets = await Bet.find({ baji, status: "Pending" });
+  const dayKey=currentGameDayKey();
+  const [y,m,d]=dayKey.split("-").map(Number);
+  const start=new Date(Date.UTC(y,m-1,d,2,30,0)), end=new Date(start.getTime()+86400000);
+  const bets=await Bet.find({baji,status:"Pending",$or:[{gameDay:dayKey},{gameDay:{$in:["",null]},createdAt:{$gte:start,$lt:end}}]});
   let winners = 0;
 
   for (const bet of bets) {
@@ -981,7 +1076,7 @@ app.post("/api/admin/results", auth, adminOnly, async (req, res) => {
 
     await Result.findOneAndUpdate(
       { key: "main" },
-      { $set: { results: next } },
+      { $set: { dayKey: currentGameDayKey(), results: next } },
       { upsert: true, new: true }
     );
 
@@ -1007,12 +1102,18 @@ app.post("/api/admin/latest-results", auth, adminOnly, async (req, res) => {
     const rows = normalizeResults(req.body.results);
     if (!rows) return res.status(400).json({ success: false, message: "Exactly 8 valid results are required." });
 
+    const previous = await getResults();
     await Result.findOneAndUpdate(
       { key: "main" },
-      { $set: { results: rows } },
+      { $set: { dayKey: currentGameDayKey(), results: rows } },
       { upsert: true, new: true }
     );
-
+    for (const row of rows) {
+      const old = previous.find(x => Number(x.baji) === Number(row.baji));
+      if (!old?.declared || old.patti !== row.patti || old.single !== row.single) {
+        await settleBaji(Number(row.baji), String(row.patti), String(row.single));
+      }
+    }
     broadcast("results", { results: rows });
     broadcast("admin-data", { type: "results-updated" });
 
@@ -1357,6 +1458,14 @@ async function ensureAdmin() {
 
   await existing.save();
 }
+
+// Hide internal stack traces and normalize malformed JSON/CORS failures.
+app.use((err, req, res, next) => {
+  if (err?.type === "entity.parse.failed") return res.status(400).json({ success:false, message:"Invalid JSON." });
+  if (String(err?.message || "").includes("CORS origin denied")) return res.status(403).json({ success:false, message:"Origin not allowed." });
+  console.error("UNHANDLED REQUEST ERROR:", err?.message || err);
+  return res.status(500).json({ success:false, message:"Request failed." });
+});
 
 /* =========================
    START

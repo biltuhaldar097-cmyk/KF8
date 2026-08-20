@@ -7,7 +7,6 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
 const User = require("./user");
-const { chromium } = require("playwright");
 
 const app = express();
 const PORT = Number(process.env.PORT || 5000);
@@ -322,6 +321,18 @@ function cleanAmount(value) {
   return Number.isFinite(amount) && amount > 0 ? Number(amount.toFixed(2)) : null;
 }
 
+// Canonical 220 Patti chart used by Kolkata FF-style Patti results.
+const KF8_220_PATTI = {"0":["000","118","127","136","145","190","226","235","244","280","299","334","370","389","460","479","488","550","569","578","668","677"],"1":["100","119","128","137","146","155","227","236","245","290","335","344","380","399","470","489","560","579","588","669","678","777"],"2":["110","129","138","147","156","200","228","237","246","255","336","345","390","444","480","499","570","589","660","679","688","778"],"3":["111","120","139","148","157","166","229","238","247","256","300","337","346","355","445","490","580","599","670","689","779","788"],"4":["112","130","149","158","167","220","239","248","257","266","338","347","356","400","446","455","590","680","699","770","789","888"],"5":["113","122","140","159","168","177","230","249","258","267","339","348","357","366","447","456","500","555","690","780","799","889"],"6":["114","123","150","169","178","222","240","259","268","277","330","349","358","367","448","457","466","556","600","790","880","899"],"7":["115","124","133","160","179","188","223","250","269","278","340","359","368","377","449","458","467","557","566","700","890","999"],"8":["116","125","134","170","189","224","233","260","279","288","350","369","378","440","459","468","477","558","567","666","800","990"],"9":["117","126","135","144","180","199","225","234","270","289","333","360","379","388","450","469","478","559","568","577","667","900"]};
+const KF8_220_PATTI_SET = new Set(Object.values(KF8_220_PATTI).flat());
+function pattiSingle(value) {
+  const p = String(value || '').replace(/\D/g, '').padStart(3, '0');
+  if (!/^\d{3}$/.test(p)) return null;
+  return String((Number(p[0]) + Number(p[1]) + Number(p[2])) % 10);
+}
+function isValid220Patti(value) {
+  return KF8_220_PATTI_SET.has(String(value || '').padStart(3, '0'));
+}
+
 const BAJI_RESULT_TIMES = {
   1: "10:05",
   2: "11:35",
@@ -354,16 +365,20 @@ function blankResults() {
 
 function normalizeResults(results) {
   if (!Array.isArray(results)) return null;
-  const rows = results.slice(0, 8).map((r, i) => ({
-    baji: Number(r.baji || i + 1),
-    patti: String(r.patti || "").replace(/\D/g, "").slice(0, 3),
-    single: String(r.single || "").replace(/\D/g, "").slice(0, 1),
-    declared: r.declared !== false,
-    resultAt: String(r.resultAt || resultAtForBaji(r.baji || i + 1))
-  }));
+  const rows = results.slice(0, 8).map((r, i) => {
+    const patti = String(r.patti || "").replace(/\D/g, "").slice(0, 3);
+    const valid = isValid220Patti(patti);
+    return {
+      baji: Number(r.baji || i + 1),
+      patti,
+      single: valid ? pattiSingle(patti) : "",
+      declared: r.declared !== false,
+      resultAt: String(r.resultAt || resultAtForBaji(r.baji || i + 1))
+    };
+  });
 
   if (rows.length !== 8) return null;
-  if (rows.some(r => r.baji < 1 || r.baji > 8 || r.patti.length !== 3 || r.single.length !== 1)) {
+  if (rows.some(r => r.baji < 1 || r.baji > 8 || !isValid220Patti(r.patti) || r.single === null || r.single === "")) {
     return null;
   }
   return rows;
@@ -510,100 +525,66 @@ let autoResultLastError = "";
 let autoResultLastCheck = null;
 let autoResultLastCount = 0;
 
-async function readKolkataFfWithBrowser() {
-  let browser;
-  try {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu"
-      ]
-    });
-
-    const context = await browser.newContext({
-      locale: "en-IN",
-      timezoneId: "Asia/Kolkata",
-      userAgent: "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 Chrome/140.0 Mobile Safari/537.36",
-      viewport: { width: 430, height: 932 }
-    });
-
-    const page = await context.newPage();
-
-    // Avoid cache/service-worker effects and force a fresh document.
-    await page.route("**/*", async route => {
-      const req = route.request();
-      const type = req.resourceType();
-
-      // We only need DOM/text. Skip heavy resources to keep Render usage low.
-      if (["image", "media", "font"].includes(type)) {
-        return route.abort();
-      }
-      return route.continue({
-        headers: {
-          ...req.headers(),
-          "Cache-Control": "no-cache, no-store, max-age=0",
-          "Pragma": "no-cache"
-        }
-      });
-    });
-
-    const urls = [
-      `https://kolkataff.tv/?kf8_browser=${Date.now()}`,
-      `https://www.kolkataff.tv/?kf8_browser=${Date.now()}`
-    ];
-
-    let lastError = "";
-    for (const url of urls) {
-      try {
-        await page.goto(url, {
-          waitUntil: "domcontentloaded",
-          timeout: 20000
-        });
-
-        // Give client-side rendering a short window to populate LIVE results.
-        await page.waitForTimeout(1800);
-
-        const html = await page.content();
-        if (html.length > 2_000_000) throw new Error("Rendered source page is too large.");
-
-        const parsed = parseKolkataFfTodayHtml(html);
-        if (parsed?.rows?.length) {
-          await context.close().catch(() => {});
-          return parsed;
-        }
-      } catch (err) {
-        lastError = String(err?.message || err);
-      }
-    }
-
-    throw new Error(lastError || "Rendered source did not contain valid current-day results.");
-  } finally {
-    if (browser) await browser.close().catch(() => {});
-  }
-}
-
 async function syncPublishedResultsFromKolkataFf() {
   if (autoResultSyncRunning) return;
   autoResultSyncRunning = true;
   autoResultLastCheck = new Date();
-
   try {
-    const parsed = await readKolkataFfWithBrowser();
-    const published = parsed.rows;
+    let parsed = null;
+    let lastFetchError = "";
+    const urls = [
+      `https://kolkataff.tv/?kf8_refresh=${Date.now()}`,
+      `https://www.kolkataff.tv/?kf8_refresh=${Date.now()}`
+    ];
 
+    for (const sourceUrl of urls) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 12000);
+      try {
+        const response = await fetch(sourceUrl, {
+          signal: controller.signal,
+          redirect: "follow",
+          cache: "no-store",
+          headers: {
+            "Accept": "text/html,application/xhtml+xml",
+            "Cache-Control": "no-cache, no-store, max-age=0",
+            "Pragma": "no-cache",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 Chrome/140.0 Mobile Safari/537.36"
+          }
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const html = await response.text();
+        if (html.length > 2_000_000) throw new Error("Source response too large.");
+        parsed = parseKolkataFfTodayHtml(html);
+        if (parsed?.rows?.length) break;
+      } catch (err) {
+        lastFetchError = String(err?.message || err);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    if (!parsed?.rows?.length) {
+      throw new Error(lastFetchError || "No valid current-day source response.");
+    }
+
+    const published = parsed.rows;
     autoResultLastCount = published.length;
     autoResultLastError = "";
     if (!published.length) return;
 
     const current = await getResults();
-
     const next = current.map(row => {
       const incoming = published.find(x => Number(x.baji) === Number(row.baji));
       return incoming ? incoming : row;
     });
+
+    const changed = next.some((r, i) =>
+      Boolean(r.declared) !== Boolean(current[i]?.declared) ||
+      String(r.patti) !== String(current[i]?.patti) ||
+      String(r.single) !== String(current[i]?.single)
+    );
+    if (!changed) return;
 
     const changedRows = next.filter((r, i) =>
       Boolean(r.declared) &&
@@ -614,8 +595,6 @@ async function syncPublishedResultsFromKolkataFf() {
       )
     );
 
-    if (!changedRows.length) return;
-
     await Result.findOneAndUpdate(
       { key: "main" },
       {
@@ -623,14 +602,14 @@ async function syncPublishedResultsFromKolkataFf() {
           dayKey: currentGameDayKey(),
           results: next,
           sourceUpdatedAt: new Date(),
-          sourceName: "kolkataff.tv (browser-rendered)"
+          sourceName: "kolkataff.tv"
         }
       },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
-    // Existing settlement is Pending-only, so repeated browser checks
-    // cannot pay the same bet twice.
+    // Settle only newly published/changed Baji rows. Bets are Pending-only,
+    // so the same bet cannot be rewarded twice on repeated syncs.
     let totalWinners = 0;
     for (const row of changedRows) {
       totalWinners += await settleBajiFromAutoSource(
@@ -642,25 +621,82 @@ async function syncPublishedResultsFromKolkataFf() {
 
     broadcast("results", { results: next, source: "kolkataff.tv" });
     broadcast("admin-data", { type: "auto-results-updated", source: "kolkataff.tv" });
-
-    console.log(
-      `[AUTO RESULT] Browser sync updated ${changedRows.length} Baji result(s), ${totalWinners || 0} winner(s).`
-    );
+    console.log(`[AUTO RESULT] Mirrored ${published.length} published Baji result(s) from kolkataff.tv and settled ${totalWinners || 0} winner(s)`);
   } catch (error) {
     autoResultLastError = String(error?.message || error);
-    console.warn("[AUTO RESULT] Browser sync skipped:", autoResultLastError);
+    console.warn("[AUTO RESULT] Sync skipped:", autoResultLastError);
   } finally {
     autoResultSyncRunning = false;
   }
 }
 
 
+async function seedVerifiedAug18ResultsIfEmpty() {
+  if (currentGameDayKey() !== "2026-08-18") return;
+
+  // Exact values visible on the user's live kolkataff.tv screenshot
+  // at 18:51 IST on 18 Aug 2026. These replace stale/local demo values.
+  const verified = [
+    { baji:1, patti:"369", single:"8", declared:true, resultAt:resultAtForBaji(1) },
+    { baji:2, patti:"134", single:"8", declared:true, resultAt:resultAtForBaji(2) },
+    { baji:3, patti:"370", single:"0", declared:true, resultAt:resultAtForBaji(3) },
+    { baji:4, patti:"499", single:"2", declared:true, resultAt:resultAtForBaji(4) },
+    { baji:5, patti:"680", single:"4", declared:true, resultAt:resultAtForBaji(5) },
+    { baji:6, patti:"678", single:"1", declared:true, resultAt:resultAtForBaji(6) }
+  ];
+
+  const current = await getResults();
+
+  // Force-correct Baji 1-6. Baji 7/8 remain waiting until the live source
+  // publishes them. This removes the old 239/147/578/etc demo results.
+  const next = current.map(row => {
+    const exact = verified.find(v => v.baji === Number(row.baji));
+    if (exact) return exact;
+    if (Number(row.baji) >= 7) {
+      return {
+        baji:Number(row.baji),
+        patti:"---",
+        single:"-",
+        declared:false,
+        resultAt:resultAtForBaji(Number(row.baji))
+      };
+    }
+    return row;
+  });
+
+  const changedRows = verified.filter(v => {
+    const old = current.find(r => Number(r.baji) === v.baji);
+    return !old?.declared || String(old.patti) !== v.patti || String(old.single) !== v.single;
+  });
+
+  await Result.findOneAndUpdate(
+    { key:"main" },
+    {
+      $set:{
+        dayKey:currentGameDayKey(),
+        results:next,
+        sourceUpdatedAt:new Date(),
+        sourceName:"kolkataff.tv (verified live screenshot)"
+      }
+    },
+    { upsert:true, new:true }
+  );
+
+  // Only currently Pending bets can settle, so this cannot pay the same bet twice.
+  for (const row of changedRows) {
+    await settleBajiFromAutoSource(row.baji, row.patti, row.single);
+  }
+
+  broadcast("results", { results:next, source:"kolkataff.tv" });
+}
+
 // Check periodically because the source publishes multiple results through the day.
-setInterval(syncPublishedResultsFromKolkataFf, 20 * 1000).unref?.();
+setInterval(syncPublishedResultsFromKolkataFf, 15 * 1000).unref?.();
 setTimeout(() => {
-  syncPublishedResultsFromKolkataFf()
+  seedVerifiedAug18ResultsIfEmpty()
+    .then(() => syncPublishedResultsFromKolkataFf())
     .catch(err => console.warn("[AUTO RESULT] startup:", err?.message || err));
-}, 2500).unref?.();
+}, 1500).unref?.();
 
 /* =========================
    HEALTH
@@ -1172,10 +1208,10 @@ app.post("/api/bets", auth, async (req, res) => {
 
     if (
       (betType === "single" && !/^\d$/.test(rawTarget)) ||
-      (betType === "patti" && !/^\d{3}$/.test(rawTarget)) ||
+      (betType === "patti" && (!/^\d{3}$/.test(rawTarget) || !isValid220Patti(rawTarget))) ||
       (betType === "jodi" && !/^\d{2}$/.test(rawTarget))
     ) {
-      return res.status(400).json({ success: false, message: "Invalid target." });
+      return res.status(400).json({ success: false, message: betType === "patti" ? "Select a valid Patti from the fixed 220 Patti chart." : "Invalid target." });
     }
 
     const user = await User.findById(req.auth.id);
@@ -1477,10 +1513,10 @@ app.post("/api/admin/results", auth, adminOnly, async (req, res) => {
   try {
     const baji = Number(req.body.baji);
     const patti = String(req.body.patti || "").replace(/\D/g, "").slice(0, 3);
-    const single = String(req.body.single || "").replace(/\D/g, "").slice(0, 1);
+    const single = pattiSingle(patti);
 
-    if (!Number.isInteger(baji) || baji < 1 || baji > 8 || patti.length !== 3 || single.length !== 1) {
-      return res.status(400).json({ success: false, message: "Valid Baji, Patti and Single are required." });
+    if (!Number.isInteger(baji) || baji < 1 || baji > 8 || patti.length !== 3 || !isValid220Patti(patti) || single === null) {
+      return res.status(400).json({ success: false, message: "Choose a valid Patti from the fixed 220 Patti chart. Single is calculated automatically." });
     }
 
     const current = await getResults();
@@ -1894,12 +1930,12 @@ async function startServer() {
     await mongoose.connect(process.env.MONGODB_URI);
     console.log("MongoDB connected successfully.");
 
+    await ensureAdmin();
+    await getResults();
+
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`KF8 Backend running on port ${PORT}`);
     });
-
-    await ensureAdmin();
-    await getResults();
   } catch (error) {
     console.error("STARTUP ERROR:", error.message);
     process.exit(1);

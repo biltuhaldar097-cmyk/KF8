@@ -22,7 +22,7 @@ if (!JWT_SECRET || JWT_SECRET.length < 32) {
 
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
-const allowedOrigins = String(process.env.ALLOWED_ORIGINS || "https://8f9b6f.netlify.app")
+const allowedOrigins = String(process.env.ALLOWED_ORIGINS || "https://amazing-crisp-8f9b6f.netlify.app,https://kolkataff8.netlify.app")
   .split(",").map(x => x.trim().replace(/\/$/, "")).filter(Boolean);
 
 app.use((req, res, next) => {

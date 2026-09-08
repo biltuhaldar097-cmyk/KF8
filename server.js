@@ -154,16 +154,24 @@ const Bet = mongoose.models.KF8Bet || mongoose.model("KF8Bet", betSchema);
 
 
 /* =========================
-   PRACTICE PATTI DATABASE
-   Separate virtual points only.
-   Never added to winningBalance/withdrawableBalance.
+   PRACTICE SINGLE + PATTI DATABASE
+   Virtual Practice PTS only.
+   This system never writes to winningBalance/withdrawableBalance.
 ========================= */
+
 const practiceWalletSchema = new mongoose.Schema(
   {
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, unique: true, index: true },
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      unique: true,
+      index: true
+    },
     username: { type: String, required: true, index: true },
     balance: { type: Number, required: true, default: 0, min: 0 },
     initialBalance: { type: Number, required: true, default: 0 },
+    creditedEvents: { type: [String], default: [] },
     initializedAt: { type: Date, default: Date.now }
   },
   { timestamps: true }
@@ -173,59 +181,110 @@ const PracticeWallet =
   mongoose.models.KF8PracticeWallet ||
   mongoose.model("KF8PracticeWallet", practiceWalletSchema);
 
-const practicePattiBetSchema = new mongoose.Schema(
-  {
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
-    username: { type: String, required: true, index: true },
-    baji: { type: Number, required: true, min: 1, max: 8, index: true },
-    gameDay: { type: String, required: true, index: true },
-    patti: { type: String, required: true },
-    stake: { type: Number, required: true, min: 0.01 },
-    multiplier: { type: Number, default: 90 },
-    payout: { type: Number, required: true },
-    status: { type: String, enum: ["Pending", "WON", "LOST"], default: "Pending", index: true },
-    result: { type: String, default: null },
-    settledAt: { type: Date, default: null }
-  },
-  { timestamps: true }
-);
-
-practicePattiBetSchema.index({ userId: 1, gameDay: 1, baji: 1, status: 1 });
-
-const PracticePattiBet =
-  mongoose.models.KF8PracticePattiBet ||
-  mongoose.model("KF8PracticePattiBet", practicePattiBetSchema);
-
-
 const practiceSingleBetSchema = new mongoose.Schema(
   {
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true
+    },
     username: { type: String, required: true, index: true },
     baji: { type: Number, required: true, min: 1, max: 8, index: true },
     gameDay: { type: String, required: true, index: true },
     digit: { type: String, required: true },
     stake: { type: Number, required: true, min: 0.01 },
-    multiplier: { type: Number, default: 9 },
+    multiplier: { type: Number, required: true, default: 9 },
     payout: { type: Number, required: true },
-    status: { type: String, enum: ["Pending", "WON", "LOST"], default: "Pending", index: true },
+    status: {
+      type: String,
+      enum: ["Pending", "WON", "LOST"],
+      default: "Pending",
+      index: true
+    },
     result: { type: String, default: null },
-    settledAt: { type: Date, default: null }
+    settledAt: { type: Date, default: null },
+    walletCredited: { type: Boolean, default: false },
+    clientRequestId: { type: String, required: true }
   },
   { timestamps: true }
 );
 
-practiceSingleBetSchema.index({ userId: 1, gameDay: 1, baji: 1, digit: 1, status: 1 });
+practiceSingleBetSchema.index(
+  { userId: 1, clientRequestId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { clientRequestId: { $type: "string" } }
+  }
+);
+practiceSingleBetSchema.index(
+  { userId: 1, gameDay: 1, baji: 1, digit: 1, status: 1 }
+);
 
 const PracticeSingleBet =
   mongoose.models.KF8PracticeSingleBet ||
   mongoose.model("KF8PracticeSingleBet", practiceSingleBetSchema);
 
+const practicePattiBetSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true
+    },
+    username: { type: String, required: true, index: true },
+    baji: { type: Number, required: true, min: 1, max: 8, index: true },
+    gameDay: { type: String, required: true, index: true },
+    patti: { type: String, required: true },
+    stake: { type: Number, required: true, min: 0.01 },
+    multiplier: { type: Number, required: true, default: 90 },
+    payout: { type: Number, required: true },
+    status: {
+      type: String,
+      enum: ["Pending", "WON", "LOST"],
+      default: "Pending",
+      index: true
+    },
+    result: { type: String, default: null },
+    settledAt: { type: Date, default: null },
+    walletCredited: { type: Boolean, default: false },
+    pairSingleBetId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "KF8PracticeSingleBet",
+      required: true,
+      index: true
+    },
+    clientRequestId: { type: String, required: true }
+  },
+  { timestamps: true }
+);
+
+practicePattiBetSchema.index(
+  { userId: 1, clientRequestId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { clientRequestId: { $type: "string" } }
+  }
+);
+practicePattiBetSchema.index(
+  { userId: 1, gameDay: 1, baji: 1, patti: 1, status: 1 }
+);
+
+const PracticePattiBet =
+  mongoose.models.KF8PracticePattiBet ||
+  mongoose.model("KF8PracticePattiBet", practicePattiBetSchema);
+
+function cleanPracticeRequestId(value) {
+  const s = String(value || "").trim();
+  if (!s) return "";
+  return s.replace(/[^a-zA-Z0-9_.:-]/g, "").slice(0, 100);
+}
+
 async function ensurePracticeWallet(user) {
   let wallet = await PracticeWallet.findOne({ userId: user._id });
   if (wallet) return wallet;
 
-  // One-time seed from the user's current account PTS.
-  // From this point onward it is completely separate from the account wallet.
   const seed = Math.max(0, Number(user.balance || 0));
 
   try {
@@ -234,12 +293,15 @@ async function ensurePracticeWallet(user) {
       username: user.username,
       balance: seed,
       initialBalance: seed,
+      creditedEvents: [],
       initializedAt: new Date()
     });
   } catch (err) {
     if (err?.code !== 11000) throw err;
     wallet = await PracticeWallet.findOne({ userId: user._id });
   }
+
+  if (!wallet) throw new Error("Practice Wallet could not be initialized.");
   return wallet;
 }
 
@@ -247,18 +309,21 @@ function practiceHistoryRows(singleBets, pattiBets) {
   const out = [];
 
   for (const bet of Array.from(singleBets || [])) {
-    const baseId = String(bet._id);
+    const id = String(bet._id);
+    const stake = Number(bet.stake || 0);
+    const payout = Number(bet.payout || 0);
 
     out.push({
-      id: `practice-db-single-entry-${baseId}`,
+      id: `practice-db-single-entry-${id}`,
       type: "Practice Single Entry",
-      details: `Snake Play Baji ${bet.baji} • Single ${bet.digit} • Stake ${Number(bet.stake || 0).toFixed(2)} PTS`,
+      details: `Snake Play Baji ${bet.baji} • Single ${bet.digit}`,
       baji: Number(bet.baji),
       target: `Single Digit (${bet.digit})`,
       rawTarget: String(bet.digit),
       betType: "practice-single",
-      stake: Number(bet.stake || 0),
-      amount: -Number(bet.stake || 0),
+      clientRequestId: String(bet.clientRequestId || ""),
+      stake,
+      amount: -stake,
       status: String(bet.status || "Pending"),
       result: bet.result || null,
       date: bet.createdAt
@@ -266,17 +331,18 @@ function practiceHistoryRows(singleBets, pattiBets) {
 
     if (String(bet.status) === "WON") {
       out.push({
-        id: `practice-db-single-payout-${baseId}`,
+        id: `practice-db-single-payout-${id}`,
         type: "Practice Single Payout",
         details: `Snake Play Baji ${bet.baji} • Single ${bet.digit} • 9x payout`,
         baji: Number(bet.baji),
         target: `Single Digit (${bet.digit})`,
         rawTarget: String(bet.digit),
         betType: "practice-single-payout",
-        stake: Number(bet.stake || 0),
-        payout: Number(bet.payout || 0),
-        amount: Number(bet.payout || 0),
-        status: "Credited",
+        clientRequestId: String(bet.clientRequestId || ""),
+        stake,
+        payout,
+        amount: payout,
+        status: bet.walletCredited ? "Credited" : "Processing",
         result: bet.result || null,
         date: bet.settledAt || bet.updatedAt || bet.createdAt
       });
@@ -284,146 +350,245 @@ function practiceHistoryRows(singleBets, pattiBets) {
   }
 
   for (const bet of Array.from(pattiBets || [])) {
-    const baseId = String(bet._id);
+    const id = String(bet._id);
+    const stake = Number(bet.stake || 0);
+    const payout = Number(bet.payout || 0);
 
     out.push({
-      id: `practice-db-patti-entry-${baseId}`,
+      id: `practice-db-patti-entry-${id}`,
       type: "Practice Patti Entry",
-      details: `Snake Play Baji ${bet.baji} • Patti ${bet.patti} • Stake ${Number(bet.stake || 0).toFixed(2)} PTS`,
+      details: `Snake Play Baji ${bet.baji} • Patti ${bet.patti}`,
       baji: Number(bet.baji),
       target: `Patti (${bet.patti})`,
       rawTarget: String(bet.patti),
       betType: "practice-patti",
-      stake: Number(bet.stake || 0),
-      amount: -Number(bet.stake || 0),
+      clientRequestId: String(bet.clientRequestId || ""),
+      stake,
+      amount: -stake,
       status: String(bet.status || "Pending"),
       result: bet.result || null,
+      pairSingleBetId: String(bet.pairSingleBetId || ""),
       date: bet.createdAt
     });
 
     if (String(bet.status) === "WON") {
       out.push({
-        id: `practice-db-patti-payout-${baseId}`,
+        id: `practice-db-patti-payout-${id}`,
         type: "Practice Patti Payout",
         details: `Snake Play Baji ${bet.baji} • Patti ${bet.patti} • 90x payout`,
         baji: Number(bet.baji),
         target: `Patti (${bet.patti})`,
         rawTarget: String(bet.patti),
         betType: "practice-patti-payout",
-        stake: Number(bet.stake || 0),
-        payout: Number(bet.payout || 0),
-        amount: Number(bet.payout || 0),
-        status: "Credited",
+        clientRequestId: String(bet.clientRequestId || ""),
+        stake,
+        payout,
+        amount: payout,
+        status: bet.walletCredited ? "Credited" : "Processing",
         result: bet.result || null,
+        pairSingleBetId: String(bet.pairSingleBetId || ""),
         date: bet.settledAt || bet.updatedAt || bet.createdAt
       });
     }
   }
 
-  return out.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+  return out.sort(
+    (a, b) => new Date(b?.date || 0).getTime() - new Date(a?.date || 0).getTime()
+  );
 }
 
 async function practiceAccountPayload(user) {
   const wallet = await ensurePracticeWallet(user);
 
   const [singleBets, pattiBets] = await Promise.all([
-    PracticeSingleBet.find({ userId: user._id }).sort({ createdAt: -1 }).limit(150).lean(),
-    PracticePattiBet.find({ userId: user._id }).sort({ createdAt: -1 }).limit(150).lean()
+    PracticeSingleBet.find({ userId: user._id })
+      .sort({ createdAt: -1 })
+      .limit(200)
+      .lean(),
+    PracticePattiBet.find({ userId: user._id })
+      .sort({ createdAt: -1 })
+      .limit(200)
+      .lean()
   ]);
 
   return {
     practiceBalance: Number(wallet.balance || 0),
-    practiceHistory: practiceHistoryRows(singleBets, pattiBets)
+    practiceHistory: practiceHistoryRows(singleBets, pattiBets),
+    practiceVersion: 3
   };
+}
+
+async function practicePayloadBestEffort(user, walletHint = null) {
+  try {
+    return await practiceAccountPayload(user);
+  } catch (err) {
+    console.error("PRACTICE PAYLOAD ERROR:", err?.message || err);
+    return {
+      practiceBalance: Number(walletHint?.balance || 0),
+      practiceVersion: 3
+    };
+  }
 }
 
 async function notifyPracticeUser(userId) {
   try {
     const user = await User.findById(userId);
     if (!user) return;
+
     const practice = await practiceAccountPayload(user);
-    sendEventToUser(user._id, "practice-account", { success: true, ...practice });
+    sendEventToUser(
+      user._id,
+      "practice-account",
+      { success: true, ...practice }
+    );
   } catch (err) {
     console.error("PRACTICE NOTIFY ERROR:", err?.message || err);
   }
 }
 
+async function creditPracticeWalletOnce(userId, eventKey, amount) {
+  const value = Number(Number(amount || 0).toFixed(2));
+  if (!(value > 0)) return PracticeWallet.findOne({ userId });
+
+  let wallet = await PracticeWallet.findOneAndUpdate(
+    {
+      userId,
+      creditedEvents: { $ne: String(eventKey) }
+    },
+    {
+      $inc: { balance: value },
+      $addToSet: { creditedEvents: String(eventKey) }
+    },
+    { new: true }
+  );
+
+  if (wallet) return wallet;
+  return PracticeWallet.findOne({ userId });
+}
+
+async function settlePracticeSingleRow(row, winningSingle) {
+  let doc = row;
+
+  if (String(row.status) === "Pending") {
+    const won = String(row.digit) === String(winningSingle);
+
+    doc = await PracticeSingleBet.findOneAndUpdate(
+      { _id: row._id, status: "Pending" },
+      {
+        $set: {
+          status: won ? "WON" : "LOST",
+          result: String(winningSingle),
+          settledAt: new Date(),
+          walletCredited: false
+        }
+      },
+      { new: true }
+    );
+
+    if (!doc) return { touchedUserId: null, newlyWon: false };
+  }
+
+  if (String(doc.status) === "WON" && doc.walletCredited !== true) {
+    const eventKey = `practice-single-win:${String(doc._id)}`;
+
+    await creditPracticeWalletOnce(
+      doc.userId,
+      eventKey,
+      Number(doc.payout || 0)
+    );
+
+    await PracticeSingleBet.updateOne(
+      { _id: doc._id },
+      { $set: { walletCredited: true } }
+    );
+  }
+
+  return {
+    touchedUserId: String(doc.userId),
+    newlyWon: String(row.status) === "Pending" && String(doc.status) === "WON"
+  };
+}
+
+async function settlePracticePattiRow(row, winningPatti) {
+  let doc = row;
+
+  if (String(row.status) === "Pending") {
+    const won = String(row.patti) === String(winningPatti);
+
+    doc = await PracticePattiBet.findOneAndUpdate(
+      { _id: row._id, status: "Pending" },
+      {
+        $set: {
+          status: won ? "WON" : "LOST",
+          result: String(winningPatti),
+          settledAt: new Date(),
+          walletCredited: false
+        }
+      },
+      { new: true }
+    );
+
+    if (!doc) return { touchedUserId: null, newlyWon: false };
+  }
+
+  if (String(doc.status) === "WON" && doc.walletCredited !== true) {
+    const eventKey = `practice-patti-win:${String(doc._id)}`;
+
+    await creditPracticeWalletOnce(
+      doc.userId,
+      eventKey,
+      Number(doc.payout || 0)
+    );
+
+    await PracticePattiBet.updateOne(
+      { _id: doc._id },
+      { $set: { walletCredited: true } }
+    );
+  }
+
+  return {
+    touchedUserId: String(doc.userId),
+    newlyWon: String(row.status) === "Pending" && String(doc.status) === "WON"
+  };
+}
+
 async function settlePracticePattiBaji(baji, patti) {
   const dayKey = currentGameDayKey();
-  const single = String(pattiSingle(String(patti)) ?? "");
+  const winningPatti = String(patti);
+  const winningSingle = String(pattiSingle(winningPatti) ?? "");
 
   const [singleRows, pattiRows] = await Promise.all([
     PracticeSingleBet.find({
       baji: Number(baji),
       gameDay: dayKey,
-      status: "Pending"
-    }).lean(),
+      $or: [
+        { status: "Pending" },
+        { status: "WON", walletCredited: { $ne: true } }
+      ]
+    }),
     PracticePattiBet.find({
       baji: Number(baji),
       gameDay: dayKey,
-      status: "Pending"
-    }).lean()
+      $or: [
+        { status: "Pending" },
+        { status: "WON", walletCredited: { $ne: true } }
+      ]
+    })
   ]);
 
   let winners = 0;
   const touchedUsers = new Set();
 
   for (const row of singleRows) {
-    const won = String(row.digit) === single;
-    const settledAt = new Date();
-
-    const claimed = await PracticeSingleBet.findOneAndUpdate(
-      { _id: row._id, status: "Pending" },
-      {
-        $set: {
-          status: won ? "WON" : "LOST",
-          result: single,
-          settledAt
-        }
-      },
-      { new: true }
-    );
-
-    if (!claimed) continue;
-    touchedUsers.add(String(claimed.userId));
-
-    if (won) {
-      await PracticeWallet.findOneAndUpdate(
-        { userId: claimed.userId },
-        { $inc: { balance: Number(claimed.payout || 0) } },
-        { new: true }
-      );
-      winners += 1;
-    }
+    const r = await settlePracticeSingleRow(row, winningSingle);
+    if (r.touchedUserId) touchedUsers.add(r.touchedUserId);
+    if (r.newlyWon) winners += 1;
   }
 
   for (const row of pattiRows) {
-    const won = String(row.patti) === String(patti);
-    const settledAt = new Date();
-
-    const claimed = await PracticePattiBet.findOneAndUpdate(
-      { _id: row._id, status: "Pending" },
-      {
-        $set: {
-          status: won ? "WON" : "LOST",
-          result: String(patti),
-          settledAt
-        }
-      },
-      { new: true }
-    );
-
-    if (!claimed) continue;
-    touchedUsers.add(String(claimed.userId));
-
-    if (won) {
-      await PracticeWallet.findOneAndUpdate(
-        { userId: claimed.userId },
-        { $inc: { balance: Number(claimed.payout || 0) } },
-        { new: true }
-      );
-      winners += 1;
-    }
+    const r = await settlePracticePattiRow(row, winningPatti);
+    if (r.touchedUserId) touchedUsers.add(r.touchedUserId);
+    if (r.newlyWon) winners += 1;
   }
 
   for (const userId of touchedUsers) {
@@ -1470,63 +1635,119 @@ function isGameClosed(baji) {
 
 
 /* =========================
-   PRACTICE PATTI API
-   Database-backed virtual points.
+   PRACTICE SINGLE + PATTI API
+   Database-backed virtual points only.
 ========================= */
 
-app.get("/api/practice/patti/account", auth, async (req, res) => {
+async function practiceAccountHandler(req, res) {
   try {
     const user = await User.findById(req.auth.id);
-    if (!user) return res.status(404).json({ success: false, message: "User not found." });
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
 
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     const payload = await practiceAccountPayload(user);
-    res.json({ success: true, ...payload });
+
+    return res.json({
+      success: true,
+      ...payload
+    });
   } catch (error) {
-    console.error("PRACTICE PATTI ACCOUNT ERROR:", error);
-    res.status(500).json({ success: false, message: "Practice wallet could not be loaded." });
+    console.error("PRACTICE ACCOUNT ERROR:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Practice Wallet could not be loaded."
+    });
   }
-});
+}
+
+app.get("/api/practice/account", auth, practiceAccountHandler);
+app.get("/api/practice/patti/account", auth, practiceAccountHandler);
 
 app.post("/api/practice/single/bets", auth, async (req, res) => {
-  let user = null;
-  let deducted = false;
-  let stake = null;
-
   try {
     const baji = Number(req.body.baji);
     const digit = String(req.body.digit ?? req.body.rawTarget ?? "").trim();
-    stake = cleanAmount(req.body.stake);
+    const stake = cleanAmount(req.body.stake);
+    const clientRequestId = cleanPracticeRequestId(req.body.clientRequestId);
+
+    if (!clientRequestId) {
+      return res.status(400).json({
+        success: false,
+        message: "Practice request id is missing. Please retry."
+      });
+    }
 
     if (!Number.isInteger(baji) || baji < 1 || baji > 8) {
       return res.status(400).json({ success: false, message: "Invalid Baji." });
     }
-    if (isGameClosed(baji)) {
-      return res.status(403).json({ success: false, message: `Baji ${baji} is closed.` });
-    }
+
     if (!/^\d$/.test(digit)) {
-      return res.status(400).json({ success: false, message: "Select a valid Single Digit." });
-    }
-    if (!stake) {
-      return res.status(400).json({ success: false, message: "Enter a valid stake." });
+      return res.status(400).json({
+        success: false,
+        message: "Select a valid Single Digit."
+      });
     }
 
-    user = await User.findById(req.auth.id);
-    if (!user) return res.status(404).json({ success: false, message: "User not found." });
+    if (!stake) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid stake."
+      });
+    }
+
+    const user = await User.findById(req.auth.id);
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
+
+    let existing = await PracticeSingleBet.findOne({
+      userId: user._id,
+      clientRequestId
+    });
+
+    if (existing) {
+      const payload = await practicePayloadBestEffort(user);
+      return res.status(200).json({
+        success: true,
+        duplicateSafeRetry: true,
+        message: `Single ${existing.digit} practice entry already saved.`,
+        bet: existing,
+        ...payload
+      });
+    }
+
+    if (isGameClosed(baji)) {
+      return res.status(403).json({
+        success: false,
+        message: `Baji ${baji} is closed.`
+      });
+    }
 
     await ensurePracticeWallet(user);
 
-    const wallet = await PracticeWallet.findOneAndUpdate(
-      { userId: user._id, balance: { $gte: stake } },
-      { $inc: { balance: -stake }, $set: { username: user.username } },
+    const walletAfterDeduction = await PracticeWallet.findOneAndUpdate(
+      {
+        userId: user._id,
+        balance: { $gte: stake }
+      },
+      {
+        $inc: { balance: -stake },
+        $set: { username: user.username }
+      },
       { new: true }
     );
 
-    if (!wallet) {
-      return res.status(400).json({ success: false, message: "Insufficient Practice Wallet balance." });
+    if (!walletAfterDeduction) {
+      return res.status(400).json({
+        success: false,
+        message: "Insufficient Practice Wallet balance."
+      });
     }
-    deducted = true;
 
     let bet;
+
     try {
       bet = await PracticeSingleBet.create({
         userId: user._id,
@@ -1537,16 +1758,39 @@ app.post("/api/practice/single/bets", auth, async (req, res) => {
         stake,
         multiplier: 9,
         payout: Number((stake * 9).toFixed(2)),
-        status: "Pending"
+        status: "Pending",
+        walletCredited: false,
+        clientRequestId
       });
     } catch (err) {
-      await PracticeWallet.updateOne({ userId: user._id }, { $inc: { balance: stake } });
-      deducted = false;
+      await PracticeWallet.updateOne(
+        { userId: user._id },
+        { $inc: { balance: stake } }
+      );
+
+      if (err?.code === 11000) {
+        existing = await PracticeSingleBet.findOne({
+          userId: user._id,
+          clientRequestId
+        });
+
+        if (existing) {
+          const payload = await practicePayloadBestEffort(user);
+          return res.status(200).json({
+            success: true,
+            duplicateSafeRetry: true,
+            message: `Single ${existing.digit} practice entry already saved.`,
+            bet: existing,
+            ...payload
+          });
+        }
+      }
+
       throw err;
     }
 
-    const payload = await practiceAccountPayload(user);
-    await notifyPracticeUser(user._id);
+    const payload = await practicePayloadBestEffort(user, walletAfterDeduction);
+    void notifyPracticeUser(user._id);
 
     return res.status(201).json({
       success: true,
@@ -1555,69 +1799,122 @@ app.post("/api/practice/single/bets", auth, async (req, res) => {
       ...payload
     });
   } catch (error) {
-    if (deducted && user && stake) {
-      await PracticeWallet.updateOne({ userId: user._id }, { $inc: { balance: stake } }).catch(() => {});
-    }
     console.error("PRACTICE SINGLE BET ERROR:", error);
-    return res.status(500).json({ success: false, message: "Practice Single entry could not be saved." });
+    return res.status(500).json({
+      success: false,
+      message: "Practice Single entry could not be saved."
+    });
   }
 });
 
 app.post("/api/practice/patti/bets", auth, async (req, res) => {
-  let deducted = false;
-  let user = null;
-
   try {
     const baji = Number(req.body.baji);
     const patti = String(req.body.patti ?? req.body.rawTarget ?? "").trim();
+    const selectedDigit = String(req.body.digit ?? "").trim();
     const stake = cleanAmount(req.body.stake);
+    const clientRequestId = cleanPracticeRequestId(req.body.clientRequestId);
+
+    if (!clientRequestId) {
+      return res.status(400).json({
+        success: false,
+        message: "Practice request id is missing. Please retry."
+      });
+    }
 
     if (!Number.isInteger(baji) || baji < 1 || baji > 8) {
       return res.status(400).json({ success: false, message: "Invalid Baji." });
     }
-    if (isGameClosed(baji)) {
-      return res.status(403).json({ success: false, message: `Baji ${baji} is closed.` });
-    }
+
     if (!stake) {
-      return res.status(400).json({ success: false, message: "Enter a valid stake." });
-    }
-    if (!/^\d{3}$/.test(patti) || !isValid220Patti(patti)) {
-      return res.status(400).json({ success: false, message: "Select a valid Patti from the fixed chart." });
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid stake."
+      });
     }
 
-    user = await User.findById(req.auth.id);
-    if (!user) return res.status(404).json({ success: false, message: "User not found." });
+    if (!/^\d{3}$/.test(patti) || !isValid220Patti(patti)) {
+      return res.status(400).json({
+        success: false,
+        message: "Select a valid Patti from the fixed chart."
+      });
+    }
+
+    const user = await User.findById(req.auth.id);
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
+
+    let existing = await PracticePattiBet.findOne({
+      userId: user._id,
+      clientRequestId
+    });
+
+    if (existing) {
+      const payload = await practicePayloadBestEffort(user);
+      return res.status(200).json({
+        success: true,
+        duplicateSafeRetry: true,
+        message: `Patti ${existing.patti} practice entry already saved.`,
+        bet: existing,
+        ...payload
+      });
+    }
+
+    if (isGameClosed(baji)) {
+      return res.status(403).json({
+        success: false,
+        message: `Baji ${baji} is closed.`
+      });
+    }
 
     const requiredDigit = String(pattiSingle(patti) ?? "");
+
+    if (selectedDigit && selectedDigit !== requiredDigit) {
+      return res.status(400).json({
+        success: false,
+        message: `Patti ${patti} belongs under Single ${requiredDigit}.`
+      });
+    }
+
     const matchingSingle = await PracticeSingleBet.findOne({
       userId: user._id,
       baji,
       gameDay: currentGameDayKey(),
       digit: requiredDigit,
       status: "Pending"
-    }).lean();
+    }).sort({ createdAt: -1 });
 
     if (!matchingSingle) {
       return res.status(409).json({
         success: false,
-        message: `First place Single ${requiredDigit} in Practice Wallet, then place Patti ${patti}.`
+        message: `First place Single ${requiredDigit}, then place Patti ${patti}.`
       });
     }
 
     await ensurePracticeWallet(user);
 
-    const wallet = await PracticeWallet.findOneAndUpdate(
-      { userId: user._id, balance: { $gte: stake } },
-      { $inc: { balance: -stake }, $set: { username: user.username } },
+    const walletAfterDeduction = await PracticeWallet.findOneAndUpdate(
+      {
+        userId: user._id,
+        balance: { $gte: stake }
+      },
+      {
+        $inc: { balance: -stake },
+        $set: { username: user.username }
+      },
       { new: true }
     );
 
-    if (!wallet) {
-      return res.status(400).json({ success: false, message: "Insufficient Practice Wallet balance." });
+    if (!walletAfterDeduction) {
+      return res.status(400).json({
+        success: false,
+        message: "Insufficient Practice Wallet balance."
+      });
     }
-    deducted = true;
 
     let bet;
+
     try {
       bet = await PracticePattiBet.create({
         userId: user._id,
@@ -1628,31 +1925,53 @@ app.post("/api/practice/patti/bets", auth, async (req, res) => {
         stake,
         multiplier: 90,
         payout: Number((stake * 90).toFixed(2)),
-        status: "Pending"
+        status: "Pending",
+        walletCredited: false,
+        pairSingleBetId: matchingSingle._id,
+        clientRequestId
       });
     } catch (err) {
-      // Roll back the practice-wallet deduction if creating the entry fails.
-      await PracticeWallet.updateOne({ userId: user._id }, { $inc: { balance: stake } });
-      deducted = false;
+      await PracticeWallet.updateOne(
+        { userId: user._id },
+        { $inc: { balance: stake } }
+      );
+
+      if (err?.code === 11000) {
+        existing = await PracticePattiBet.findOne({
+          userId: user._id,
+          clientRequestId
+        });
+
+        if (existing) {
+          const payload = await practicePayloadBestEffort(user);
+          return res.status(200).json({
+            success: true,
+            duplicateSafeRetry: true,
+            message: `Patti ${existing.patti} practice entry already saved.`,
+            bet: existing,
+            ...payload
+          });
+        }
+      }
+
       throw err;
     }
 
-    const payload = await practiceAccountPayload(user);
-    await notifyPracticeUser(user._id);
+    const payload = await practicePayloadBestEffort(user, walletAfterDeduction);
+    void notifyPracticeUser(user._id);
 
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
       message: `Patti ${patti} practice entry saved.`,
       bet,
       ...payload
     });
   } catch (error) {
-    if (deducted && user) {
-      console.error("PRACTICE PATTI BET ERROR AFTER DEDUCTION:", error);
-    } else {
-      console.error("PRACTICE PATTI BET ERROR:", error);
-    }
-    res.status(500).json({ success: false, message: "Practice Patti entry could not be saved." });
+    console.error("PRACTICE PATTI BET ERROR:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Practice Patti entry could not be saved."
+    });
   }
 });
 

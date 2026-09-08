@@ -2599,64 +2599,123 @@ app.post("/api/admin/withdrawals/:requestId", auth, adminOnly, async (req, res) 
 });
 
 /* =========================
-   ADMIN BALANCE TRANSFER
+   ADMIN PRACTICE PTS ADJUSTMENT
+   Separate virtual Practice Wallet only.
+   Never writes to user.balance, winningBalance or withdrawableBalance.
 ========================= */
 
-app.post("/api/admin/transfer", auth, adminOnly, async (req, res) => {
+app.post("/api/admin/practice-transfer", auth, adminOnly, async (req, res) => {
   try {
     const username = cleanUsername(req.body.username);
     const amount = cleanAmount(req.body.amount);
     const action = String(req.body.action || "add").toLowerCase();
 
     if (!username || !amount || !["add", "deduct"].includes(action)) {
-      return res.status(400).json({ success: false, message: "Username, valid amount and action are required." });
+      return res.status(400).json({
+        success: false,
+        message: "Username, valid amount and action are required."
+      });
     }
 
-    const user = await User.findOne({ username: { $regex: new RegExp("^" + username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$", "i") } });
-    if (!user) return res.status(404).json({ success: false, message: "User not found." });
-
-    const current = Number(user.balance || 0);
-    const next = action === "add" ? current + amount : current - amount;
-
-    if (next < 0) {
-      return res.status(400).json({ success: false, message: "Balance cannot go below zero." });
-    }
-
-    user.balance = Number(next.toFixed(2));
-
-    const tx = {
-      id: new mongoose.Types.ObjectId().toString(),
-      type: action === "add" ? "Admin Transfer" : "Admin Deduction",
-      amount: action === "add" ? amount : -amount,
-      status: "Completed",
-      details: `Admin ${action === "add" ? "added" : "deducted"} balance`,
-      date: new Date()
-    };
-
-    user.transactionHistory.unshift(tx);
-    await user.save();
-    await recordLedger(
-      user,
-      "DEMO_ADJUSTMENT",
-      action === "add" ? amount : -amount,
-      `admin-transfer:${tx.id}`,
-      { action, demo: true }
-    );
-    await writeAudit(req, `DEMO_BALANCE_${action.toUpperCase()}`, user, tx.id, {
-      amount, demo: true
+    const escaped = username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const user = await User.findOne({
+      username: { $regex: new RegExp("^" + escaped + "$", "i") }
     });
-    await notifyUser(user);
 
-    res.json({
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found."
+      });
+    }
+
+    await ensurePracticeWallet(user);
+
+    let wallet;
+
+    if (action === "deduct") {
+      // Atomic check + deduction, so concurrent requests cannot push below zero.
+      wallet = await PracticeWallet.findOneAndUpdate(
+        {
+          userId: user._id,
+          balance: { $gte: amount }
+        },
+        {
+          $inc: { balance: -amount },
+          $set: { username: user.username }
+        },
+        { new: true }
+      );
+
+      if (!wallet) {
+        const currentWallet = await PracticeWallet.findOne({ userId: user._id }).lean();
+        return res.status(400).json({
+          success: false,
+          message: `Insufficient Practice PTS. Current Practice Wallet: ${Number(currentWallet?.balance || 0).toFixed(2)} PTS`
+        });
+      }
+    } else {
+      wallet = await PracticeWallet.findOneAndUpdate(
+        { userId: user._id },
+        {
+          $inc: { balance: amount },
+          $set: { username: user.username }
+        },
+        { new: true }
+      );
+    }
+
+    if (!wallet) {
+      return res.status(500).json({
+        success: false,
+        message: "Practice Wallet could not be updated."
+      });
+    }
+
+    const referenceId = new mongoose.Types.ObjectId().toString();
+
+    // Audit/notification are best-effort. A successful wallet update must not
+    // be turned into a false "failed" toast just because an auxiliary log fails.
+    try {
+      await writeAudit(
+        req,
+        `PRACTICE_PTS_${action.toUpperCase()}`,
+        user,
+        referenceId,
+        {
+          amount: Number(amount),
+          practiceOnly: true,
+          balanceAfter: Number(wallet.balance || 0)
+        }
+      );
+    } catch (auditErr) {
+      console.warn("PRACTICE ADMIN AUDIT WARNING:", auditErr?.message || auditErr);
+    }
+
+    try {
+      await notifyPracticeUser(user._id);
+    } catch (notifyErr) {
+      console.warn("PRACTICE ADMIN NOTIFY WARNING:", notifyErr?.message || notifyErr);
+    }
+
+    return res.json({
       success: true,
-      message: action === "add" ? "Demo balance added." : "Demo balance deducted.",
-      user: publicUser(user)
+      message:
+        action === "add"
+          ? "Practice PTS added."
+          : "Practice PTS deducted.",
+      username: user.username,
+      practiceBalance: Number(wallet.balance || 0)
     });
   } catch (error) {
-    console.error("ADMIN TRANSFER ERROR:", error);
-    res.status(500).json({ success: false, message: "Balance update failed." });
+    console.error("ADMIN PRACTICE TRANSFER ERROR:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Practice PTS update failed."
+    });
   }
 });
+
 
 /* =========================
    ADMIN BOOTSTRAP
